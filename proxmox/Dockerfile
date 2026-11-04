@@ -9,7 +9,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  # llvmpipe would pass for a GPU when none is passed in (Vulkan on the CPU, far slower than the CPU backend)
  && rm -f /usr/share/vulkan/icd.d/lvp_icd*.json \
- # a fixed id for the render group: create-ct.sh hands /dev/dri/renderD128 to gid 993
+ # a fixed id for the render group: install.sh hands /dev/dri/renderD128 to gid 993
  && (getent group render >/dev/null && groupmod -g 993 render || groupadd -g 993 render) \
  && useradd --system --home-dir /var/lib/assist-asr --create-home --groups render,video assist-asr \
  && python3 -m venv /opt/assist-asr/venv \

@@ -177,21 +177,28 @@ systemd services. If the host has an AMD or Intel iGPU, it's shared with the con
 through, so the host and other containers keep it, and there's none of the reset trouble of handing an
 AMD iGPU to a VM).
 
-On any machine with Docker:
+In the Proxmox host's shell (nothing to install there, no Docker, no git):
 
 ```sh
-proxmox/build-template.sh        # -> dist/assist-asr-light-<date>-amd64.tar.zst (~220 MB)
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nt-f/assist-asr/main/proxmox/install.sh)"
 ```
 
-Copy that file and `proxmox/create-ct.sh` to the Proxmox host, then:
+It asks for Home Assistant's address and token, the model, and whether to share the GPU (or "advanced" for
+the id, storage, bridge, cores, memory and disk). It then downloads the template from the latest release
+(~250 MB, checked against its SHA-256), creates the container, and prints its address for the Wyoming
+integration. Settings live in the container's `/etc/assist-asr/assist-asr.env`.
+
+Without questions, e.g. for a script:
 
 ```sh
-./create-ct.sh --template assist-asr-light-<date>-amd64.tar.zst \
+curl -fsSL https://raw.githubusercontent.com/Nt-f/assist-asr/main/proxmox/install.sh | bash -s -- --yes \
     --hass-url http://192.168.1.10:8123 --hass-token <token> [--model 1.7B] [--gpu no]
 ```
 
-It prints the container's address for the Wyoming integration. `--help` lists the other options (id,
-storage, bridge, cores, memory, disk). Settings live in the container's `/etc/assist-asr/assist-asr.env`.
+`--help` lists every option. The template is built by GitHub Actions
+(`.github/workflows/proxmox-template.yml`) for each `v*` tag. To build one yourself, on any machine with
+Docker: `proxmox/build-template.sh`, then `install.sh --template assist-asr-light-<date>-amd64.tar.zst` on
+the host.
 
 The template is llama.cpp's own base, Ubuntu 26.04. A Proxmox that doesn't know that release yet makes it
 an "unmanaged" container, which configures its own network by DHCP. It was tested by booting it under
@@ -375,7 +382,7 @@ docker-compose.cpu.yml ... with vLLM's CPU build
 compose.light.yml    the light version: llama.cpp + the Wyoming server, CPU
 compose.light.cuda.yml, compose.light.vulkan.yml   ... on an NVIDIA GPU, on an AMD/Intel GPU or iGPU
 vllm-slim/           the small vLLM image (what a Qwen3-ASR server loads, nothing else)
-proxmox/             build-template.sh, create-ct.sh, the CT's services (rootfs/)
+proxmox/             install.sh (run on the host), build-template.sh, the CT's services (rootfs/)
 engine/              asr-engine: llama.cpp's library, one batched pass per name check (compose.engine.yml)
 .env.example         settings (copy to .env)
 config/              commands.txt, vocab.txt, optional music.txt and home.txt

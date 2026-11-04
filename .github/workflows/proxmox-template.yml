@@ -1,0 +1,41 @@
+# Builds the Proxmox CT template and attaches it to the release, where proxmox/install.sh downloads it.
+# A tag v* makes the release; run by hand (Actions -> Run workflow) it only builds, as a workflow artifact.
+name: Proxmox CT template
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the template
+        run: |
+          command -v zstd >/dev/null || { sudo apt-get update && sudo apt-get install -y zstd; }
+          NAME=assist-asr-light-amd64 proxmox/build-template.sh
+          cd dist && sha256sum assist-asr-light-amd64.tar.zst > assist-asr-light-amd64.tar.zst.sha256
+
+      - name: Attach it to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            dist/assist-asr-light-amd64.tar.zst dist/assist-asr-light-amd64.tar.zst.sha256
+
+      - name: Keep it as a workflow artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: assist-asr-light-amd64
+          path: dist/assist-asr-light-amd64.tar.zst*
+          compression-level: 0
