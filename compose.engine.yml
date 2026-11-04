@@ -1,0 +1,48 @@
+# The light version on asr-engine (engine/) instead of llama-server: the name check scores all candidates in
+# one batched pass (~70 ms on a desktop CPU instead of ~0.7 s). Use instead of compose.light.yml:
+#   docker compose -f compose.engine.yml up -d                  CPU
+#   ENGINE_VARIANT=server-vulkan docker compose -f compose.engine.yml up -d   + devices, see compose.engine.vulkan.yml
+name: assist-asr-engine
+services:
+  engine:
+    image: assist-asr-engine:${ENGINE_VARIANT:-server}
+    build:
+      context: .
+      dockerfile: engine/Dockerfile
+      args:
+        VARIANT: ${ENGINE_VARIANT:-server}
+    restart: unless-stopped
+    cpuset: ${CPU_CORES:-}
+    environment:
+      MODEL: ${LIGHT_MODEL:-ggml-org/Qwen3-ASR-0.6B-GGUF:Q8_0}
+    volumes:
+      - ./data/engine-models:/models
+    command: --host 0.0.0.0 --port 8080 ${ENGINE_ARGS:-}
+    ports:
+      - "127.0.0.1:${LLAMA_PORT:-8120}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      start_period: 600s
+
+  wyoming:
+    build:
+      context: .
+      dockerfile: wyoming/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      engine:
+        condition: service_healthy
+    ports:
+      - "${WYOMING_PORT:-10300}:10300"
+    env_file: .env
+    environment:
+      BACKEND: engine
+      LLAMA_URL: http://engine:8080
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 10300), 2)"]
+      interval: 5s
+      start_period: 120s

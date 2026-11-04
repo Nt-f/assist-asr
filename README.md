@@ -154,6 +154,22 @@ In Home Assistant:
 2. Enter this machine's address and port `10300`.
 3. Go to **Settings → Voice assistants**, open your assistant and pick it as **Speech-to-text**.
 
+### The light version on asr-engine (experimental)
+
+`compose.engine.yml` runs the light version on `engine/`: a small server on llama.cpp's own library
+instead of llama-server. It encodes the audio once and scores all of a name check's candidates in one
+batched pass. Measured on a 12-core CPU with the 0.6B:
+- **Name check:** about 100 ms instead of about 550 ms with llama-server.
+- **Accuracy:** names 78.5% exactly right instead of 74.6%.
+- **Speed:** slowest 10% of requests 665 ms instead of 1006 ms, but the median plain request is about
+  70 ms slower (392 against 319 ms).
+
+```sh
+docker compose -f compose.engine.yml up -d            # CPU; ENGINE_VARIANT=server-vulkan or server-cuda for a GPU
+```
+
+It's built against llama.cpp build b12098 (`engine/Dockerfile`); its image and source move together.
+
 ### On Proxmox
 
 `proxmox/` builds a CT template and makes a container from it: the light version without Docker, with
@@ -360,6 +376,7 @@ compose.light.yml    the light version: llama.cpp + the Wyoming server, CPU
 compose.light.cuda.yml, compose.light.vulkan.yml   ... on an NVIDIA GPU, on an AMD/Intel GPU or iGPU
 vllm-slim/           the small vLLM image (what a Qwen3-ASR server loads, nothing else)
 proxmox/             build-template.sh, create-ct.sh, the CT's services (rootfs/)
+engine/              asr-engine: llama.cpp's library, one batched pass per name check (compose.engine.yml)
 .env.example         settings (copy to .env)
 config/              commands.txt, vocab.txt, optional music.txt and home.txt
 plugin/asr_bias.py   the vLLM plugin

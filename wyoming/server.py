@@ -56,7 +56,9 @@ from wyoming.event import Event
 from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info
 from wyoming.server import AsyncEventHandler, AsyncServer
 
-BACKEND = os.environ.get("BACKEND", "vllm")  # vllm, or llamacpp (llama.cpp's llama-server: CPU, Vulkan, CUDA)
+BACKEND = os.environ.get("BACKEND", "vllm")  # vllm; engine (engine/: llama.cpp's library, CPU/Vulkan/CUDA); llamacpp (llama-server)
+LLAMA = BACKEND in ("llamacpp", "engine")  # the llama.cpp path (prompts, restarts) is shared
+ENGINE = BACKEND == "engine"
 VLLM_URL = os.environ.get("VLLM_URL", "http://vllm:8000").rstrip("/")
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://llama:8080").rstrip("/")
 MODEL = os.environ.get("MODEL", "qwen3-asr")
@@ -97,7 +99,8 @@ WAKE_PHRASES = [p for p in os.environ.get(
 # an HA sensor its prompt can read (README "Alternatives for your LLM"). ALT_RANGE: how close (nats).
 ALTERNATIVES = os.environ.get("ALTERNATIVES", "")  # e.g. sensor.asr_alternatives
 ALT_RANGE = float(os.environ.get("ALT_RANGE", "6"))
-NAME_CANDIDATES = int(os.environ.get("NAME_CANDIDATES", "4" if BACKEND == "llamacpp" else "6"))
+NAME_EARLY_STOP = os.environ.get("NAME_EARLY_STOP", "1") != "0"  # llama.cpp: stop once no name left can win
+NAME_CANDIDATES = int(os.environ.get("NAME_CANDIDATES", "4" if BACKEND == "llamacpp" else "6"))  # the engine scores them at once
 # Words between a command and its name that are not part of the name ("play some Zola",
 # "turn off the lamp"); a name may still start with them ("The Beatles").
 FILLERS = {"*": ["the", "my", "some", "a"],
@@ -355,13 +358,13 @@ def _chat(wav: bytes, prompt: str, xargs=None, top: int = 0) -> dict:
 def transcribe(wav: bytes, language: str, prompt: str, bias=None, wake: str = "", slot: int = 0):
     """wake: a wake phrase forced as the transcript's start ("Alexa,"); it is then part of the returned
     head, not of the text or tokens, and transcribe.logprob covers it too."""
-    if BACKEND == "llamacpp":
+    if LLAMA:
         return _lc_transcribe(wav, language, prompt, bias, wake, slot)
     return _vllm_transcribe(wav, language, prompt, bias, wake)
 
 
 def force_score(wav: bytes, prompt: str, text: str) -> float:
-    if BACKEND == "llamacpp":
+    if LLAMA:
         return _lc_force(wav, prompt, text)
     return _vllm_force(wav, prompt, text)
 
@@ -500,7 +503,24 @@ def _lc_prompt(prompt: str, language: str) -> str:
             f"language {LANGUAGES.get(language, language)}<asr_text>")
 
 
+def _engine_split(prompt_string: str):
+    """The engine keeps everything up to "<asr_text>" encoded; what follows is sent as text."""
+    i = prompt_string.index("<asr_text>") + len("<asr_text>")
+    return prompt_string[:i], prompt_string[i:]
+
+
+def _engine_score(wav: bytes, prompt: str, given: str, tails: list, end: bool = True, language: str = "") -> list:
+    base = _lc_prompt(prompt, language or LANGUAGE)
+    r = _lc_post("/score", {"wav": base64.b64encode(wav).decode(), "prompt": base, "given": given,
+                            "tails": tails, "end": end})
+    return r["scores"]
+
+
 def _lc_complete(wav: bytes, prompt_string: str, n_probs: int = 0, grammar: str = "", slot: int = 0) -> list:
+    if ENGINE:  # no grammar there: forcing goes through _engine_score
+        base, text = _engine_split(prompt_string)
+        return _lc_post("/generate", {"wav": base64.b64encode(wav).decode(), "prompt": base, "text": text,
+                                      "n_probs": n_probs, "max_tokens": 200}).get("completion_probabilities") or []
     body = {"prompt": {"prompt_string": prompt_string, "multimodal_data": [base64.b64encode(wav).decode()]},
             "temperature": 0, "n_predict": 200, "n_probs": n_probs, "cache_prompt": True, "id_slot": slot}
     if grammar:
@@ -550,6 +570,8 @@ def _lc_transcribe(wav: bytes, language: str, prompt: str, bias=None, wake: str 
 
 def _lc_prefix_lp(wav: bytes, prompt: str, language: str, wake: str) -> float:
     """Raw logprob of the transcript starting with wake: its tokens forced, the rest left open."""
+    if ENGINE:
+        return _engine_score(wav, prompt, "", [wake], end=False, language=language)[0]
     lit = wake.replace("\\", "\\\\").replace('"', '\\"')
     steps = _lc_complete(wav, _lc_prompt(prompt, language), n_probs=1,
                          grammar=f'root ::= "{lit}" [^\\x00]*')
@@ -569,6 +591,8 @@ def _lc_force(wav: bytes, prompt: str, text: str, tail: str = None) -> float:
     head, _, body = text.partition("<asr_text>")
     language = next((k for k, v in LANGUAGES.items() if head == f"language {v}"), LANGUAGE)
     given, forced = (body, tail) if tail is not None else ("", body)
+    if ENGINE:
+        return _engine_score(wav, prompt, given, [forced], language=language)[0]
     lit = forced.replace("\\", "\\\\").replace('"', '\\"')
     steps = _lc_complete(wav, _lc_prompt(prompt, language) + given, n_probs=1, grammar=f'root ::= "{lit}"')
     return sum(e["logprob"] for e in steps)
@@ -620,7 +644,7 @@ def word_alternatives(raw: str, toks, head: str, wav: bytes, language: str, prom
         return whole.strip()
 
     picked = sorted(spots)[:n]
-    if BACKEND == "llamacpp":
+    if LLAMA:  # one slot / one engine: one after another
         return [w for w in map(decode, picked) if w]
     return [w for w in _pool.map(decode, picked) if w]
 
@@ -781,15 +805,39 @@ def name_check(raw: str, toks, head: str, wav: bytes, prompt: str, heard_lp: flo
     texts = [whole] + [prefix + " " + names[c] + ending for c in cands]
     # what was heard is scored by its own decode (raw logprobs, before the plugin's push)
     t_score = time.monotonic()
-    if BACKEND == "llamacpp":
+    if ENGINE:
+        # All at once: the engine copies the encoded audio to a sequence per candidate and scores them
+        # in one batched pass (~70 ms on a desktop CPU for 6, where llama-server took ~0.7 s).
+        heard_tail = whole[len(prefix):] if whole.startswith(prefix) else " " + rest + ending
+        _, _, given = (head + prefix).partition("<asr_text>")
+        scores = _engine_score(wav, prompt, given, [heard_tail] + [" " + names[c] + ending for c in cands])
+        if pruned:
+            pruned_best = max(b[c] for c in pruned)
+    elif LLAMA:
         # One slot, one at a time, and only from the name on: the words before it are the same for all,
         # so they go into the (cached) prompt and each candidate costs just its own few tokens (forcing
         # the whole sentence each time took ~1 s a check on a CPU). What was heard is scored the same way.
         heard_tail = whole[len(prefix):] if whole.startswith(prefix) else " " + rest + ending
-        tails = [heard_tail] + [" " + names[c] + ending for c in cands]
-        scores = [_lc_force(wav, prompt, head + prefix, t) for t in tails]
-        if pruned:  # the bounds are of the name's first token alone: right in this space as they are
-            pruned_best = max(b[c] for c in pruned)
+        hyp_s = _lc_force(wav, prompt, head + prefix, heard_tail)
+        # Branch and bound: a name scores at most what its first token did in the decode (b), so the most
+        # promising go first, and the check stops once no name left could win or come within SLOT_MARGIN
+        # of the best: usually 1-2 of the candidates are scored. (In parallel slots llama.cpp's server
+        # would encode the audio again in each: on a CPU that costs more than it saves, measured.)
+        got, skipped = {}, []
+        order = sorted(cands, key=lambda c: b[c], reverse=True) if firsts else list(cands)
+        for c in order:
+            if firsts and got and NAME_EARLY_STOP:
+                best_s = max(got.values())
+                if b[c] < best_s - SLOT_MARGIN or (b[c] < hyp_s - SLOT_PRIOR and best_s < hyp_s - SLOT_PRIOR):
+                    skipped = [x for x in order if x not in got]
+                    break
+            got[c] = _lc_force(wav, prompt, head + prefix, " " + names[c] + ending)
+        scores = [hyp_s] + [got.get(c, float("-inf")) for c in cands]
+        bounds_left = [b[c] for c in pruned + skipped] if firsts else []
+        if bounds_left:  # the bounds are of the name's first token alone: right in this space as they are
+            pruned, pruned_best = pruned + skipped, max(bounds_left)
+        log.debug("name check: scored %d of %d (bounds %s, best %.1f, heard %.1f)", len(got), len(cands),
+                 [round(b[c], 1) for c in order] if firsts else "-", max(got.values()), hyp_s)
     elif _score["prefill"]:
         # One pass each, in parallel, what was heard too, and without the context prompt: a request with
         # prompt_logprobs cannot use vLLM's prefix cache, so the ~450 tokens of context were prefilled again
@@ -986,7 +1034,7 @@ async def main():
         ok = await refresh()
         asyncio.get_running_loop().create_task(_later(refresher, CONTEXT_REFRESH if ok else 30))
     await warm_up()
-    log.info("listening on %d, %s", PORT, f"llama.cpp at {LLAMA_URL}" if BACKEND == "llamacpp" else f"vLLM at {VLLM_URL}")
+    log.info("listening on %d, %s", PORT, f"{BACKEND} at {LLAMA_URL}" if LLAMA else f"vLLM at {VLLM_URL}")
     await AsyncServer.from_uri(f"tcp://0.0.0.0:{PORT}").run(Handler)
 
 
