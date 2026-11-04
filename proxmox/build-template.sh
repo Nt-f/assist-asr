@@ -8,12 +8,13 @@ cd "$(dirname "$0")/.."
 ARCH=${ARCH:-amd64}
 NAME=${NAME:-assist-asr-light-$(date +%Y%m%d)-$ARCH}
 mkdir -p dist
-docker build --platform "linux/$ARCH" -f proxmox/Dockerfile -t "assist-asr-ct:$ARCH" .
-cid=$(docker create --platform "linux/$ARCH" "assist-asr-ct:$ARCH")
-trap 'docker rm -f "$cid" >/dev/null 2>&1; rm -f "dist/$NAME.tar"' EXIT
-docker export "$cid" > "dist/$NAME.tar"
-# Docker's marker file: systemd would think it runs in Docker
-tar --delete -f "dist/$NAME.tar" .dockerenv 2>/dev/null || true
+trap 'rm -f "dist/$NAME.tar"' EXIT
+# The root filesystem straight to a tar (BuildKit): no container, so no /.dockerenv (systemd would think it
+# runs in Docker) and no editing the archive (tar --delete corrupted it, on GitHub's runner).
+docker build --platform "linux/$ARCH" -f proxmox/Dockerfile --output "type=tar,dest=dist/$NAME.tar" .
+tar tf "dist/$NAME.tar" >/dev/null || { echo "the archive does not read cleanly"; exit 1; }
+if tar tf "dist/$NAME.tar" | grep -qx '\(\./\)\?\.dockerenv'; then echo "the archive has /.dockerenv"; exit 1; fi
 zstd -q -19 -T0 -f "dist/$NAME.tar" -o "dist/$NAME.tar.zst"
+zstd -dc "dist/$NAME.tar.zst" | tar tf - >/dev/null
 ls -lh "dist/$NAME.tar.zst"
 echo "Next, on the Proxmox host: install.sh --template $NAME.tar.zst"
