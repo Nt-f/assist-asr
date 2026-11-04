@@ -527,7 +527,11 @@ def _lc_complete(wav: bytes, prompt_string: str, n_probs: int = 0, grammar: str 
             "temperature": 0, "n_predict": 200, "n_probs": n_probs, "cache_prompt": True, "id_slot": slot}
     if grammar:
         body["grammar"] = grammar
-    return _lc_post("/completion", body).get("completion_probabilities") or []
+    steps = _lc_post("/completion", body).get("completion_probabilities") or []
+    if any(e.get("logprob") is None for e in steps):  # NaN in JSON: the backend computed garbage
+        raise RuntimeError("llama.cpp returned no probabilities (NaN): its GPU backend fails on this "
+                           "GPU; DEVICE=cpu runs it on the CPU")
+    return steps
 
 
 def _lc_transcribe(wav: bytes, language: str, prompt: str, bias=None, wake: str = "", slot: int = 0):
