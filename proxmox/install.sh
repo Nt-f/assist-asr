@@ -184,11 +184,12 @@ for _ in $(seq 30); do
   [ -n "$IP" ] && break
   sleep 2
 done
+HOST=${IP:-"<the CT's address>"}
 cat <<MSG
 
 CT $ID is up${IP:+ at $IP}. The model downloads on first start (1-2.5 GB): watch it with
   pct exec $ID -- journalctl -fu assist-asr-llama -u assist-asr-wyoming
 It's ready once the log says "listening on 10300". Then in Home Assistant: Settings -> Devices & services ->
-Add integration -> Wyoming Protocol -> host ${IP:-<the CT's address>}, port 10300.
+Add integration -> Wyoming Protocol -> host $HOST, port 10300.
 Settings: pct exec $ID -- nano /etc/assist-asr/assist-asr.env (then restart both services).
 MSG
