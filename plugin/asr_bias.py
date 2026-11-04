@@ -256,8 +256,9 @@ class AsrBias(_Base):
                 ids, top = both[:end - start], both[end - start:]
             else:
                 ids, top = [], top_t.tolist()
-            # head ("language English<asr_text>"): the language, as /audio/transcriptions forces it
-            if head and self.marker not in ids and self._force(logits, row, slot, end, head, ids, True):
+            # head ("language English<asr_text>", maybe a wake phrase after it): forced until all of it is
+            # written (_force says False once it is, or once the text went another way)
+            if head and self._force(logits, row, slot, end, head, ids, True):
                 continue
             bias = load(path)
             if bias is None:

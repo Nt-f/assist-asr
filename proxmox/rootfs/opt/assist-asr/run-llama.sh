@@ -6,4 +6,4 @@ if [ "$dev" = auto ]; then
 fi
 if [ "$dev" = gpu ]; then ngl=99; else ngl=0; fi
 echo "assist-asr: $LIGHT_MODEL on the $dev"
-exec /app/llama-server -hf "$LIGHT_MODEL" -c 4096 -np 1 -ngl "$ngl" --host 127.0.0.1 --port 8080 $LLAMA_ARGS
+exec /app/llama-server -hf "$LIGHT_MODEL" -c 8192 -np 2 -ngl "$ngl" --host 127.0.0.1 --port 8080 $LLAMA_ARGS

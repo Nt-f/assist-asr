@@ -21,6 +21,8 @@ Environment (defaults):
   W_CMD (3.0), W_SLOT (2.5): logit added on a command's / a name's path
   SLOT_PRIOR (8), SLOT_MARGIN (3): the name check's thresholds, in nats; NAME_CANDIDATES (6, llama.cpp 4)
   BACKEND (vllm): or llamacpp, with LLAMA_URL (http://llama:8080): compose.light.yml
+  WAKE_FORCE (auto: a mangled wake word decoded again with it forced; off), WAKE_PRIOR (8), WAKE_PHRASES
+  ALTERNATIVES (unset; e.g. sensor.asr_alternatives: close alternatives for an LLM agent), ALT_RANGE (6)
   WAKE_WORDS (alexa|alexis|alex|amazon|computer|echo|ziggy|jarvis|mycroft|nabu; "hey"/"ok" before one is dropped too)
   VAD_THRESHOLD (0.3), MIN_SPEECH_MS (150), PAD_MS (300)
   RECORD_DIR (unset): keep each request's audio + transcript there (bench/label.py turns them
@@ -29,6 +31,9 @@ Environment (defaults):
 
 import asyncio
 import base64
+import http.client
+import threading
+import urllib.parse
 import difflib
 import io
 import json
@@ -81,6 +86,17 @@ SLOT_PRIOR = float(os.environ.get("SLOT_PRIOR", "8"))
 SLOT_MARGIN = float(os.environ.get("SLOT_MARGIN", "3"))
 # Names weighed in a check: on vLLM they are scored in parallel, on llama.cpp one after another (~25 ms a
 # token on a CPU), hence fewer there.
+# A mangled wake word ("Lex allowed her" for "Alexa, louder"): decoded again with the wake phrase forced
+# first, kept when the audio supports it within WAKE_PRIOR nats (auto) or never (off).
+WAKE_FORCE = os.environ.get("WAKE_FORCE", "auto")
+WAKE_PRIOR = float(os.environ.get("WAKE_PRIOR", "8"))
+# How each wake word is said in full ("hey"/"okay" included), for forcing it.
+WAKE_PHRASES = [p for p in os.environ.get(
+    "WAKE_PHRASES", "Alexa|Computer|Echo|Amazon|Ziggy|Hey Jarvis|Hey Mycroft|Okay Nabu").split("|") if p]
+# Alternatives for an LLM conversation agent (off unless set): the transcripts it might also have been, in
+# an HA sensor its prompt can read (README "Alternatives for your LLM"). ALT_RANGE: how close (nats).
+ALTERNATIVES = os.environ.get("ALTERNATIVES", "")  # e.g. sensor.asr_alternatives
+ALT_RANGE = float(os.environ.get("ALT_RANGE", "6"))
 NAME_CANDIDATES = int(os.environ.get("NAME_CANDIDATES", "4" if BACKEND == "llamacpp" else "6"))
 # Words between a command and its name that are not part of the name ("play some Zola",
 # "turn off the lamp"); a name may still start with them ("The Beatles").
@@ -250,36 +266,74 @@ def read_vocab() -> str:
     return ", ".join(w for w in words if w)
 
 
+# HA's names and Music Assistant's library: fetched in the background every CONTEXT_REFRESH (a request
+# never waits for HA), kept on disk (CACHE_FILE) so a restart has them at once, also with HA down.
+CACHE_FILE = os.environ.get("CACHE_FILE", os.path.join(os.path.dirname(BIAS_FILE) or "/data", "names-cache.json"))
+
+
 async def context() -> str:
-    # Same text on every request until the next refresh: it comes before the audio in the
-    # prompt, so vLLM's prefix cache keeps its KV and the context costs little per request.
-    if time.monotonic() - _context["at"] > CONTEXT_REFRESH:
-        _context["at"] = time.monotonic()  # one try per period even if HA is down
-        names = _context.get("names", [])
-        if HASS_URL and HASS_TOKEN:
+    """The context prompt, as of the last refresh. Same text every request until the next one: it comes
+    before the audio in the prompt, so vLLM's prefix cache keeps its KV and it costs little per request."""
+    return _context.get("text", "")
+
+
+async def apply_names(names: list, music: list) -> None:
+    ha, vocab = context_of(names), read_vocab()
+    _context["text"] = ". ".join(p for p in (ha, vocab) if p) if USE_CONTEXT else ""
+    log.info("context: %d chars of HA names, %d of vocabulary%s", len(ha), len(vocab),
+             "" if USE_CONTEXT else " (not sent)")
+    if BIAS_FILE:
+        try:
+            await asyncio.to_thread(write_bias, names, music)
+            log.info("bias: %d HA names, %d music names, w_cmd %.1f w_slot %.1f",
+                     len(names), len(music), W_CMD, W_SLOT)
+        except OSError as e:
+            log.warning("bias file: %s", e)
+
+
+def load_cache() -> bool:
+    try:
+        with open(CACHE_FILE) as f:
+            c = json.load(f)
+        _context["names"], _context["music"] = c.get("names", []), c.get("music", [])
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def save_cache() -> None:
+    tmp = CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"names": _context.get("names", []), "music": _context.get("music", []), "at": time.time()}, f)
+    os.replace(tmp, CACHE_FILE)
+
+
+async def refresh() -> bool:
+    """Names from HA and Music Assistant; True when HA answered. The last ones stay when it does not."""
+    ok = False
+    if HASS_URL and HASS_TOKEN:
+        try:
+            _context["names"] = await asyncio.to_thread(ha_names)
+            ok = True
+        except Exception as e:
+            log.warning("HA names: %s", e)
+        if BIAS_FILE and ok:
             try:
-                names = _context["names"] = await asyncio.to_thread(ha_names)
-            except Exception as e:  # keep the last names HA gave; HA restarting: again in 30 s
-                log.warning("HA context: %s", e)
-                _context["at"] = time.monotonic() - CONTEXT_REFRESH + 30
-            if BIAS_FILE:
-                try:
-                    _context["music"] = await asyncio.to_thread(music_library)
-                except Exception as e:
-                    log.warning("Music Assistant library: %s", e)
-        ha, vocab = context_of(names), read_vocab()
-        _context["text"] = ". ".join(p for p in (ha, vocab) if p) if USE_CONTEXT else ""
-        log.info("context: %d chars of HA names, %d of vocabulary%s", len(ha), len(vocab),
-                 "" if USE_CONTEXT else " (not sent)")
-        if BIAS_FILE:
-            music = _context.get("music", [])
+                _context["music"] = await asyncio.to_thread(music_library)
+            except Exception as e:
+                log.warning("Music Assistant library: %s", e)
+        if ok:
             try:
-                await asyncio.to_thread(write_bias, names, music)
-                log.info("bias: %d HA names, %d music names, w_cmd %.1f w_slot %.1f",
-                         len(names), len(music), W_CMD, W_SLOT)
+                await asyncio.to_thread(save_cache)
             except OSError as e:
-                log.warning("bias file: %s", e)
-    return _context["text"]
+                log.warning("names cache: %s", e)
+    await apply_names(_context.get("names", []), _context.get("music", []))
+    return ok
+
+
+async def refresher() -> None:
+    while True:  # again in 30 s while HA is unreachable (restarting), else every CONTEXT_REFRESH
+        await asyncio.sleep(CONTEXT_REFRESH if await refresh() else 30)
 
 
 def _chat(wav: bytes, prompt: str, xargs=None, top: int = 0) -> dict:
@@ -298,10 +352,12 @@ def _chat(wav: bytes, prompt: str, xargs=None, top: int = 0) -> dict:
         return json.loads(r.read())["choices"][0]
 
 
-def transcribe(wav: bytes, language: str, prompt: str, bias=None):
+def transcribe(wav: bytes, language: str, prompt: str, bias=None, wake: str = "", slot: int = 0):
+    """wake: a wake phrase forced as the transcript's start ("Alexa,"); it is then part of the returned
+    head, not of the text or tokens, and transcribe.logprob covers it too."""
     if BACKEND == "llamacpp":
-        return _lc_transcribe(wav, language, prompt, bias)
-    return _vllm_transcribe(wav, language, prompt, bias)
+        return _lc_transcribe(wav, language, prompt, bias, wake, slot)
+    return _vllm_transcribe(wav, language, prompt, bias, wake)
 
 
 def force_score(wav: bytes, prompt: str, text: str) -> float:
@@ -310,14 +366,14 @@ def force_score(wav: bytes, prompt: str, text: str) -> float:
     return _vllm_force(wav, prompt, text)
 
 
-def _vllm_transcribe(wav: bytes, language: str, prompt: str, bias=None):
+def _vllm_transcribe(wav: bytes, language: str, prompt: str, bias=None, wake: str = ""):
     """(transcript, tokens after <asr_text> as (text, logprob, {alternative: logprob}), head).
     Through chat completions (not /audio/transcriptions) for the logprobs; Qwen3-ASR then names the
     language itself ("language English<asr_text>..."), head is that part. bias: (w_cmd, w_slot)."""
     xargs = None
     if bias and BIAS_FILE:
         xargs = {"asr_bias": BIAS_FILE, "w_cmd": bias[0], "w_slot": bias[1],
-                 "head": f"language {LANGUAGES.get(language, language)}<asr_text>"}
+                 "head": f"language {LANGUAGES.get(language, language)}<asr_text>{wake}"}
     c = _chat(wav, prompt, xargs, top=20)
     content = c["message"]["content"] or ""
     head, sep, text = content.partition("<asr_text>")
@@ -334,11 +390,82 @@ def _vllm_transcribe(wav: bytes, language: str, prompt: str, bias=None):
         if t["token"].startswith("<|"):
             continue
         toks.append((t["token"], t["logprob"], {a["token"]: a["logprob"] for a in t["top_logprobs"]}))
+    if wake:  # the forced wake phrase belongs to the head, as on llama.cpp (where it is in the prompt)
+        acc, n = "", 0
+        while n < len(toks) and len(acc) < len(wake):
+            acc += toks[n][0]
+            n += 1
+        if acc == wake and text.startswith(wake):
+            toks, text = toks[n:], text[len(wake):]
+            return text.strip(), toks, head + sep + wake
     return text.strip(), toks, head + sep
 
 
+# Qwen3-ASR's own chat template, plus the assistant's turn written out: with it a candidate transcript is
+# part of the prompt, and one forward pass gives every one of its tokens' logprobs (prompt_logprobs), where
+# generating it under force took a step per token (~150 ms a name check, against ~30). Needs vLLM started
+# with --trust-request-chat-template (docker-compose.yml has it); without, the forced generation below.
+SCORE_TEMPLATE = (
+    "{%- set ns = namespace(system_text='') -%}"
+    "{%- for m in messages -%}{%- if m.role == 'system' -%}"
+    "{%- if m.content is string -%}{%- set ns.system_text = ns.system_text + m.content -%}"
+    "{%- else -%}{%- for c in m.content -%}{%- if c.type == 'text' and (c.text is defined) -%}"
+    "{%- set ns.system_text = ns.system_text + c.text -%}{%- endif -%}{%- endfor -%}{%- endif -%}"
+    "{%- endif -%}{%- endfor -%}"
+    "{%- set ns2 = namespace(audio_tokens='') -%}"
+    "{%- for m in messages -%}{%- if m.content is not string -%}{%- for c in m.content -%}"
+    "{%- if c.type == 'audio' or ('audio' in c) or ('audio_url' in c) -%}"
+    "{%- set ns2.audio_tokens = ns2.audio_tokens + '<|audio_start|><|audio_pad|><|audio_end|>' -%}"
+    "{%- endif -%}{%- endfor -%}{%- endif -%}{%- endfor -%}"
+    "{{- '<|im_start|>system\\n' + ns.system_text + '<|im_end|>\\n' -}}"
+    "{{- '<|im_start|>user\\n' + ns2.audio_tokens + '<|im_end|>\\n' -}}"
+    "{%- for m in messages -%}{%- if m.role == 'assistant' -%}"
+    "{%- if m.content is string -%}{%- set t = m.content -%}"
+    "{%- else -%}{%- set t = m.content | selectattr('type', 'equalto', 'text') | map(attribute='text') | join('') -%}"
+    "{%- endif -%}"
+    "{{- '<|im_start|>assistant\\n' + t + '<|im_end|>\\n' -}}{%- endif -%}{%- endfor -%}")
+_score = {"prefill": True}
+
+
+def _vllm_score(wav: bytes, prompt: str, text: str) -> float:
+    msgs = [{"role": "user", "content": [{"type": "input_audio", "input_audio": {
+        "data": base64.b64encode(wav).decode(), "format": "wav"}}]}, {"role": "assistant", "content": text}]
+    if prompt:
+        msgs.insert(0, {"role": "system", "content": prompt})
+    body = {"model": MODEL, "messages": msgs, "max_tokens": 1, "temperature": 0, "prompt_logprobs": 0,
+            "add_generation_prompt": False, "chat_template": SCORE_TEMPLATE}
+    req = urllib.request.Request(VLLM_URL + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        pl = json.loads(r.read()).get("prompt_logprobs") or []
+    lp, seen = 0.0, False
+    for pos in pl:  # each: {token id: {logprob, decoded_token}} for the prompt's token there
+        if not pos:
+            continue
+        e = next(iter(pos.values()))
+        tok = e.get("decoded_token", "")
+        if seen:
+            lp += e["logprob"]
+            if tok == "<|im_end|>":
+                break
+        seen = seen or tok == "<asr_text>"
+    if not seen:
+        raise ValueError("no <asr_text> in the scored prompt")
+    return lp
+
+
 def _vllm_force(wav: bytes, prompt: str, text: str) -> float:
-    """How well the audio supports text: summed raw logprob with the decoder forced to write it."""
+    """How well the audio supports text: summed raw logprob of its tokens after <asr_text>, the end included.
+    Scored in one pass (above); generated under force when the server refuses request templates."""
+    if _score["prefill"]:
+        try:
+            return _vllm_score(wav, prompt, text)
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise
+            _score["prefill"] = False
+            log.warning("vLLM refuses request chat templates (start it with --trust-request-chat-template): "
+                        "the name check generates its candidates instead, slower")
     c = _chat(wav, prompt, {"force": text})
     lp, seen = 0.0, False
     for t in (c.get("logprobs") or {}).get("content") or []:
@@ -373,17 +500,17 @@ def _lc_prompt(prompt: str, language: str) -> str:
             f"language {LANGUAGES.get(language, language)}<asr_text>")
 
 
-def _lc_complete(wav: bytes, prompt_string: str, n_probs: int = 0, grammar: str = "") -> list:
+def _lc_complete(wav: bytes, prompt_string: str, n_probs: int = 0, grammar: str = "", slot: int = 0) -> list:
     body = {"prompt": {"prompt_string": prompt_string, "multimodal_data": [base64.b64encode(wav).decode()]},
-            "temperature": 0, "n_predict": 200, "n_probs": n_probs, "cache_prompt": True, "id_slot": 0}
+            "temperature": 0, "n_predict": 200, "n_probs": n_probs, "cache_prompt": True, "id_slot": slot}
     if grammar:
         body["grammar"] = grammar
     return _lc_post("/completion", body).get("completion_probabilities") or []
 
 
-def _lc_transcribe(wav: bytes, language: str, prompt: str, bias=None):
-    head = f"language {LANGUAGES.get(language, language)}<asr_text>"
-    p = _lc_prompt(prompt, language)
+def _lc_transcribe(wav: bytes, language: str, prompt: str, bias=None, wake: str = "", slot: int = 0):
+    head = f"language {LANGUAGES.get(language, language)}<asr_text>{wake}"
+    p = _lc_prompt(prompt, language) + wake
     b = asr_bias.load(BIAS_FILE) if bias and BIAS_FILE else None
     text, toks, lp = "", [], 0.0
 
@@ -392,7 +519,7 @@ def _lc_transcribe(wav: bytes, language: str, prompt: str, bias=None):
         return tok_lp + b.weight(asr_bias.norm(at + (tok or " ")), bias[0], bias[1], bias[0])
 
     for _ in range(6):
-        steps = _lc_complete(wav, p + text, n_probs=20)
+        steps = _lc_complete(wav, p + text, n_probs=20, slot=slot)
         restart = False
         for e in steps:
             tok = e["token"]
@@ -415,8 +542,24 @@ def _lc_transcribe(wav: bytes, language: str, prompt: str, bias=None):
             text += tok
         if not restart:
             break
+    if wake and slot == 0:  # the forced phrase was in the prompt: its own score, so totals compare with a
+        lp += _lc_prefix_lp(wav, prompt, language, wake)  # free decode (alternatives, slot 1, need none)
     transcribe.logprob = lp
     return text.strip(), toks, head
+
+
+def _lc_prefix_lp(wav: bytes, prompt: str, language: str, wake: str) -> float:
+    """Raw logprob of the transcript starting with wake: its tokens forced, the rest left open."""
+    lit = wake.replace("\\", "\\\\").replace('"', '\\"')
+    steps = _lc_complete(wav, _lc_prompt(prompt, language), n_probs=1,
+                         grammar=f'root ::= "{lit}" [^\\x00]*')
+    lp, acc = 0.0, ""
+    for e in steps:
+        if len(acc) >= len(wake):
+            break
+        acc += e["token"]
+        lp += e["logprob"]
+    return lp
 
 
 def _lc_force(wav: bytes, prompt: str, text: str, tail: str = None) -> float:
@@ -446,7 +589,117 @@ LANGUAGES = {"en": "English", "de": "German", "fr": "French", "es": "Spanish", "
              "ko": "Korean", "ar": "Arabic", "he": "Hebrew"}
 
 
-def name_check(raw: str, toks, head: str, wav: bytes, prompt: str, heard_lp: float) -> str:
+def word_alternatives(raw: str, toks, head: str, wav: bytes, language: str, prompt: str, n: int = 2) -> list:
+    """Transcripts that go another way at an unsure word: where a word's first token had a close second
+    (within ALT_RANGE / 3 nats), decoded again with the text up to there and that second forced, the rest
+    left to the model (as the wake word forcing does). At most n, at the closest calls; on vLLM in parallel."""
+    if not toks:
+        return []
+    spots, pos = [], 0
+    for i, (t, lp, alt) in enumerate(toks):
+        word_start = i == 0 or t[:1] == " "
+        if word_start and asr_bias.norm(t).strip():
+            for a, l in alt.items():
+                if (a[:1] == " " or i == 0) and asr_bias.norm(a).strip() and \
+                        asr_bias.norm(a).strip() != asr_bias.norm(t).strip() and l >= lp - ALT_RANGE / 3:
+                    spots.append((lp - l, pos, a))
+        pos += len(t)
+    text = "".join(t for t, _, _ in toks)
+    _, _, given = head.partition("<asr_text>")  # a forced wake phrase stays in front
+
+    def decode(spot):
+        _, p, a = spot
+        forced = given + text[:p] + a
+        try:
+            # llama.cpp: slot 1, beside the name check in slot 0 (each slot caches the audio on its own)
+            _, rest_toks, _ = transcribe(wav, language, prompt, (W_CMD, W_SLOT), forced, slot=1)
+        except Exception:
+            return ""
+        rest = "".join(t for t, _, _ in rest_toks)  # the tokens keep their spaces; the text is trimmed
+        whole = rest if rest.startswith(forced) else forced + rest
+        return whole.strip()
+
+    picked = sorted(spots)[:n]
+    if BACKEND == "llamacpp":
+        return [w for w in map(decode, picked) if w]
+    return [w for w in _pool.map(decode, picked) if w]
+
+
+def publish_alternatives(text: str, alts: list) -> None:
+    """The sensor's state: the alternatives joined (HA cuts states at 255); the full list in attributes."""
+    seen, uniq = {asr_bias.norm(text).strip()}, []
+    for a in alts:
+        k = asr_bias.norm(strip_wake(a)).strip()
+        if k and k not in seen:
+            seen.add(k)
+            uniq.append(strip_wake(a))
+    body = {"state": " | ".join(uniq)[:250] or "none",
+            "attributes": {"transcript": text, "alternatives": uniq[:3], "friendly_name": "Speech-to-text alternatives",
+                           "icon": "mdi:account-voice"}}
+    _hass_keep("POST", f"/api/states/{ALTERNATIVES}", body)
+
+
+_keep = {"conn": None, "lock": threading.Lock()}
+
+
+def _hass_keep(method: str, path: str, body) -> None:
+    """One kept-open connection to HA for what goes out on every request (a new one costs a handshake),
+    1 s at most: a slow HA never holds up the transcript long."""
+    u = urllib.parse.urlsplit(HASS_URL)
+    data = json.dumps(body).encode()
+    headers = {"Authorization": f"Bearer {HASS_TOKEN}", "Content-Type": "application/json"}
+    with _keep["lock"]:
+        for attempt in (1, 2):  # a connection HA closed meanwhile: once more on a new one
+            if _keep["conn"] is None:
+                cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+                _keep["conn"] = cls(u.hostname, u.port, timeout=1)
+            try:
+                _keep["conn"].request(method, (u.path.rstrip("/") + path), body=data, headers=headers)
+                r = _keep["conn"].getresponse()
+                r.read()
+                return
+            except (OSError, http.client.HTTPException):
+                _keep["conn"].close()
+                _keep["conn"] = None
+                if attempt == 2:
+                    raise
+
+
+def wake_guess(raw: str, toks) -> str:
+    """The wake phrase a transcript without one probably starts with, mangled ("Lex allowed her",
+    "Hey, Minecraft"), or "": by sound against its first words, or a wake word among the first token's
+    alternatives."""
+    if WAKE_FORCE == "off" or not raw or WAKE_RE.match(raw):
+        return ""
+    words = raw.split()
+    alts = toks[0][2] if toks else {}
+    best, best_s = "", 0.0
+    for ph in WAKE_PHRASES:
+        n = len(ph.split())
+        s = max(difflib.SequenceMatcher(None, _sounds(" ".join(words[:k])), _sounds(ph)).ratio()
+                for k in (n, n + 1))
+        p = asr_bias.norm(ph).strip()
+        if any(len(asr_bias.norm(a).strip()) >= 3 and p.startswith(asr_bias.norm(a).strip()) and lp > -10
+               for a, lp in alts.items()):
+            s += 0.5
+        if s > best_s:
+            best, best_s = ph, s
+    return best if best_s >= 0.6 else ""
+
+
+_sounds_cache = {}
+
+
+def _sounds_of(kind: str, names: dict) -> dict:
+    """Each name's sound-alike spelling, worked out once per list (the lists change every 10 minutes at most)."""
+    held = _sounds_cache.get(kind)
+    if held is None or held[0] is not names:  # a refresh made a new list
+        held = _sounds_cache[kind] = (names, {n: _sounds(n) for n in names})
+    return held[1]
+
+
+def name_check(raw: str, toks, head: str, wav: bytes, prompt: str, heard_lp: float, close=None) -> str:
+    """close: a list the names that came close are added to (as whole transcripts), for ALTERNATIVES."""
     bias = asr_bias.load(BIAS_FILE) if BIAS_FILE else None
     lists = _context.get("lists") or {}
     if bias is None or not toks:
@@ -477,21 +730,32 @@ def name_check(raw: str, toks, head: str, wav: bytes, prompt: str, heard_lp: flo
             firsts = {}
             break
     heard = asr_bias.norm(rest).strip()
-    if not heard or heard in names:
+    if not heard:
+        return raw
+    if heard in names:
+        # One of the names, as said: written as HA / Music Assistant spell it, punctuation and all
+        # ("Hillel's MacBook Pro AirPlay" -> "Hillel’s MacBook Pro (AirPlay)"), since HA's own sentences
+        # match a name only exactly.
+        exact = (prefix + " " + names[heard] + ending).strip()
+        if exact != raw and asr_bias.norm(exact) == asr_bias.norm(raw):
+            log.info("name spelled as listed (%s): %r -> %r", kind, raw, exact)
+            return exact
         return raw
     if any(f" {n} " in f" {heard} " for n in names):
         return raw  # a known name with more around it ("living room lights"): HA's own sentences
     whole = "".join(t for t, _, _ in toks)
     hs = _sounds(heard)
+    t_pick = time.monotonic()
+    sounds = _sounds_of(kind, names)
+    like = {n: difflib.SequenceMatcher(None, hs, sounds[n]).ratio() for n in names}
 
     def pick(n):
         s1 = max([lp for a, lp in firsts.items() if a and n.startswith(a)], default=-15.0)
-        return max(s1, -15.0) + 6 * difflib.SequenceMatcher(None, hs, _sounds(n)).ratio()
+        return max(s1, -15.0) + 6 * like[n]
 
     # The first letter alone pulls towards the wrong names (" D" -0.07 for "Zola" heard as "Dola"),
     # so half the shortlist is by sound only.
-    by_sound = sorted(names, key=lambda n: difflib.SequenceMatcher(None, hs, _sounds(n)).ratio(),
-                      reverse=True)
+    by_sound = sorted(names, key=like.get, reverse=True)
     half = NAME_CANDIDATES // 2
     cands = list(dict.fromkeys(by_sound[:NAME_CANDIDATES - half] + sorted(names, key=pick, reverse=True)[:half]))
     pruned = []
@@ -516,6 +780,7 @@ def name_check(raw: str, toks, head: str, wav: bytes, prompt: str, heard_lp: flo
             return raw
     texts = [whole] + [prefix + " " + names[c] + ending for c in cands]
     # what was heard is scored by its own decode (raw logprobs, before the plugin's push)
+    t_score = time.monotonic()
     if BACKEND == "llamacpp":
         # One slot, one at a time, and only from the name on: the words before it are the same for all,
         # so they go into the (cached) prompt and each candidate costs just its own few tokens (forcing
@@ -525,6 +790,17 @@ def name_check(raw: str, toks, head: str, wav: bytes, prompt: str, heard_lp: flo
         scores = [_lc_force(wav, prompt, head + prefix, t) for t in tails]
         if pruned:  # the bounds are of the name's first token alone: right in this space as they are
             pruned_best = max(b[c] for c in pruned)
+    elif _score["prefill"]:
+        # One pass each, in parallel, what was heard too, and without the context prompt: a request with
+        # prompt_logprobs cannot use vLLM's prefix cache, so the ~450 tokens of context were prefilled again
+        # for every candidate (6: ~220 ms, without: ~65). The check compares candidates on the same audio,
+        # which the context does not change; the decode itself keeps it.
+        # A small context of its own instead: just the names compared (~30 tokens). The context helps the
+        # scores (measured: 82 % right with the full one, 80 % with none); this keeps that where it counts.
+        short = ", ".join(names[c] for c in cands)
+        scores = list(_pool.map(lambda t: force_score(wav, short, head + t), texts))
+        if pruned:
+            pruned_best = max(b[c] for c in pruned) + (scores[0] - heard_slot)
     else:
         scores = [heard_lp] + list(_pool.map(lambda t: force_score(wav, prompt, head + t), texts[1:]))
     hyp, ranked = scores[0], sorted(zip(scores[1:], cands), reverse=True)
@@ -532,8 +808,14 @@ def name_check(raw: str, toks, head: str, wav: bytes, prompt: str, heard_lp: flo
     if firsts and pruned:
         second = max(second, pruned_best)
     ok = best >= hyp - SLOT_PRIOR and best - second >= SLOT_MARGIN
-    log.info("name check (%s): %r %.1f vs %s -> %s", kind, rest, hyp,
+    log.info("name check (%s, pick %d ms, score %d ms): %r %.1f vs %s -> %s", kind,
+             (t_score - t_pick) * 1000, (time.monotonic() - t_score) * 1000, rest, hyp,
              ", ".join(f"{names[c]!r} {s:.1f}" for s, c in ranked[:3]), names[name] if ok else "kept")
+    if close is not None:  # the runners-up the audio supports nearly as well, and what was heard if replaced
+        close += [texts[1 + cands.index(c)].strip() for s, c in ranked
+                  if s >= hyp - ALT_RANGE and not (ok and c == name)]
+        if ok:
+            close.append(raw)
     return texts[1 + cands.index(name)].strip() if ok else raw
 
 
@@ -612,14 +894,48 @@ class Handler(AsyncEventHandler):
                     except Exception as e:
                         log.error("transcription failed: %s", e)
                         raw, toks = "", []
+                guess = wake_guess(raw, toks)
+                if guess:
+                    try:
+                        w = await asyncio.to_thread(transcribe, wav, self.language, ctx, (W_CMD, W_SLOT),
+                                                    guess + ",")
+                        w_lp = transcribe.logprob
+                        keep = w_lp >= heard_lp - WAKE_PRIOR
+                        log.info("wake word forced (%s): %r %.1f -> %r %.1f: %s", guess, raw, heard_lp,
+                                 w[0], w_lp, "kept" if keep else "not supported by the audio")
+                        if keep:
+                            raw, toks, head = w
+                            raw = raw[:1].upper() + raw[1:]
+                            heard_lp = w_lp
+                    except Exception as e:
+                        log.error("wake word forcing failed: %s", e)
                 t_dec = t_chk = time.monotonic()
+                alts = []
+                alt_task = None
+                if ALTERNATIVES and HASS_URL and HASS_TOKEN and raw:
+                    # alongside the name check: both need only the decode (vLLM batches them on the GPU)
+                    alt_task = asyncio.ensure_future(asyncio.to_thread(
+                        word_alternatives, raw, toks, head, wav, self.language, ctx))
+                decoded = raw
                 if BIAS_FILE and raw:
                     try:
-                        raw = await asyncio.to_thread(name_check, raw, toks, head, wav, ctx, heard_lp)
+                        raw = await asyncio.to_thread(name_check, raw, toks, head, wav, ctx, heard_lp, alts)
+                        # (alts: this request's list of close transcripts, for ALTERNATIVES)
                     except Exception as e:
                         log.error("name check failed: %s", e)
                     t_chk = time.monotonic()
                 text = strip_wake(raw)
+                if alt_task is not None:
+                    try:
+                        words = await alt_task
+                        if raw == decoded:  # the name check rewrote it: its own alternatives stand
+                            alts += words
+                    except Exception as e:
+                        log.warning("alternatives: %s", e)
+                    try:  # before the transcript goes out: the LLM reads the sensor right after
+                        await asyncio.to_thread(publish_alternatives, text, alts)
+                    except Exception as e:
+                        log.warning("alternatives sensor: %s", e)
                 log.info("%.1f s audio, %d ms speech, %d ms (vad %d, decode %d, name check %d): %r -> %r",
                          len(pcm) / 32000, speech_ms, (time.monotonic() - t0) * 1000, (t_vad - t0) * 1000,
                          (t_dec - t_vad) * 1000, (t_chk - t_dec) * 1000, raw, text)
@@ -635,6 +951,11 @@ class Handler(AsyncEventHandler):
             self.pcm.clear()
             return False
         return True
+
+
+async def _later(fn, delay: float):
+    await asyncio.sleep(delay)
+    await fn()
 
 
 async def warm_up():
@@ -657,7 +978,13 @@ async def warm_up():
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    await context()
+    if load_cache():  # last time's names at once; HA asked in the background
+        await apply_names(_context.get("names", []), _context.get("music", []))
+        log.info("names from %s; refreshing from HA in the background", CACHE_FILE)
+        asyncio.get_running_loop().create_task(refresher())
+    else:  # nothing on disk yet: wait for HA once, then in the background
+        ok = await refresh()
+        asyncio.get_running_loop().create_task(_later(refresher, CONTEXT_REFRESH if ok else 30))
     await warm_up()
     log.info("listening on %d, %s", PORT, f"llama.cpp at {LLAMA_URL}" if BACKEND == "llamacpp" else f"vLLM at {VLLM_URL}")
     await AsyncServer.from_uri(f"tcp://0.0.0.0:{PORT}").run(Handler)

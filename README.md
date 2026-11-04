@@ -74,6 +74,10 @@ bf16 weights.
 The old setup (`wyoming-whisper`, Qwen3-ASR 0.6B ONNX int4, CPU only) took 303 ms on 12 cores and
 1229 ms on 2.
 
+Since these were measured, the name check got faster and more accurate (scored in one pass, about 40 ms
+on vLLM) and a mangled wake word is forced: on vLLM, names now come out 83–85% exactly right (from 77–78%),
+everyday commands 98–99% (from 96%), your noisy recordings 91% (from 82–86%).
+
 Exactly right on the same 62 requests: 1.7B 81–84% ours against 66% stock, 0.6B 73–77% against 58–65%,
 on every runtime. The Q8 models of the light version are as accurate as vLLM's bf16 here.
 
@@ -190,6 +194,8 @@ All of these go in `.env`. Restart with `docker compose up -d` after a change.
 | `CONTEXT` | `1` | Also gives the model your names and `config/vocab.txt` as a prompt. |
 | `W_CMD`, `W_SLOT` | `3.0`, `2.5` | Push strength towards commands and names. Higher fixes more, but risks hearing a name that wasn't said. |
 | `SLOT_PRIOR`, `SLOT_MARGIN` | `8`, `3` | Name check: how far below what was heard a name may score and still win, and how far it must beat the next name. |
+| `WAKE_FORCE` | `auto` | When a transcript starts with what sounds like a mangled wake word ("Lex allowed her"), decode again with the wake phrase forced and keep that if the audio supports it. `off` turns it off. |
+| `ALTERNATIVES` | (off) | Experimental: an HA sensor (e.g. `sensor.asr_alternatives`) that gets what the request might also have been, for an LLM agent. See below. |
 | `WAKE_WORDS` | `alexa\|…\|nabu` | Wake words dropped from the start of a transcript ("hey"/"ok" in front of one too: Hey Jarvis, Okay Nabu). |
 | `RECORD_DIR` | `/data/rec` | Keeps every request's audio in `data/rec`, for building your own test set. Leave empty to turn it off. |
 
@@ -204,6 +210,26 @@ The files in `config/` are reread every 10 minutes:
 `docker compose logs wyoming` shows every request with where its time went, e.g.
 `1.9 s audio, 1536 ms speech, 99 ms (vad 0, decode 99, name check 0): 'Alexa, play X.' -> 'Play X.'`.
 A `name check` line shows the scores whenever a name was weighed against your list.
+
+## Alternatives for your LLM (experimental)
+
+Most requests aren't matched by Home Assistant's own sentences and go to the conversation agent, often an
+LLM. With `ALTERNATIVES=sensor.asr_alternatives`, each request also writes what it might have been to that
+sensor, before the transcript goes to HA. The alternatives are the names that came close in the name check,
+and, where a word was a close call, the transcript decoded again from that word with the other choice.
+Requests with something unsure take about 100 ms longer.
+
+The sensor's `alternatives` attribute has up to three, and `transcript` has what was sent. In your LLM agent's
+prompt (its instructions are a template):
+
+```jinja
+{% set alts = state_attr('sensor.asr_alternatives', 'alternatives') %}
+{% if alts %}Speech recognition was unsure. The request may also have been: {{ alts | join(' / ') }}.
+Prefer the reading that names a device, area or music that exists here.{% endif %}
+```
+
+There is one sensor for all satellites, so two requests at the same moment can overwrite each other. It's
+off by default until this has been tried with a real LLM.
 
 ## vLLM on a CPU
 
@@ -313,9 +339,14 @@ Home Assistant ──Wyoming──▶ wyoming/server.py ──HTTP──▶ vLLM
   tokens, so it doesn't matter how the model splits a name into tokens. It only looks among the 40
   tokens the model already rates highest, so it can't put in a name the audio doesn't support.
 
-  The same plugin can also make the model write a given text. The name check uses that to score
-  candidate names: names only differ after their first letter, and one pass can't go back once it has
-  written the first letter.
+  The name check scores candidate names on the whole word: names only differ after their first letter,
+  and one pass can't go back once it has written it. On vLLM each candidate is scored in a single forward
+  pass with the candidate text as part of the prompt (`prompt_logprobs`, through a chat template the
+  server sends: vLLM runs with `--trust-request-chat-template`), all in parallel, with only the compared
+  names as context: about 40 ms a check. On llama.cpp each candidate is generated under a grammar, one
+  after another: fast on a GPU, up to about 0.8 s on a CPU.
+- HA's names and Music Assistant's library are refreshed in the background every 10 minutes and kept in
+  `data/names-cache.json`, so no request waits for HA, and a restart has your names even with HA down.
 - When a request doesn't ask for it, the plugin leaves it alone. That's why `vllm://` in the benchmark
   is the bare model.
 

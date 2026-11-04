@@ -23,6 +23,9 @@ Scoring, after a leading wake word is dropped from both sides and numbers are sp
   exact  the transcript's words are the words said (punctuation and case aside)
   WER    word error rate over all clips
   names  of the clips with a "name": that name is in the transcript, spelled as listed
+  intent with --hass: of the clips whose true sentence Home Assistant's own sentences understand, the
+         share where the transcript gets the same intent with the same names (HA's Assist debug API:
+         nothing is carried out). HASS_URL/HASS_TOKEN from the environment or ./.env
   ms     median time from the end of the audio to the transcript (--realtime: audio streamed at
          speaking pace, so work a server does while it arrives is not counted, as in real use)
 --noise N adds a second pass with room noise mixed in at N dB below the speech (seeded: the
@@ -231,16 +234,66 @@ async def cmd_run(a):
                     clips.append(dict(file=r["file"], text=r["text"], name=r.get("name"),
                                       in_list=r.get("in_list"), hyp=hyp, ms=round(dt * 1000, 1),
                                       **score(r, hyp)))
+                if a.hass:
+                    await add_intents(clips, a.language)
                 run = dict(dataset=dname, condition=cname, system=sname, clips=clips)
                 results["runs"].append(run)
                 s = summary(run)
                 print(f"{a.tag:8} {sname:10} {dname:12} {cname:12} exact {s['exact']:5.1f}%  "
-                      f"WER {s['wer']:5.1f}%  names {s['names']}  {s['ms']:.0f} ms  "
+                      f"WER {s['wer']:5.1f}%  names {s['names']}  "
+                      f"{'intent ' + s['intent'] + '  ' if a.hass else ''}{s['ms']:.0f} ms  "
                       f"({len(clips)} clips, {time.monotonic() - t0:.0f} s)", flush=True)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=1)
     print(f"-> {a.out}")
+
+
+def hass_env():
+    env = {k: os.environ.get(k, "") for k in ("HASS_URL", "HASS_TOKEN")}
+    if not all(env.values()) and os.path.exists(".env"):
+        for l in open(".env"):
+            k, _, v = l.strip().partition("=")
+            if k in env and not env[k]:
+                env[k] = v
+    if not all(env.values()):
+        sys.exit("--hass: set HASS_URL and HASS_TOKEN (environment or ./.env)")
+    return env["HASS_URL"].rstrip("/"), env["HASS_TOKEN"]
+
+
+async def hass_understands(sentences: list, language: str) -> list:
+    """What HA's built-in agent makes of each sentence, nothing carried out: (intent, slots, all matched)."""
+    import aiohttp
+    url, token = hass_env()
+    out = []
+    async with aiohttp.ClientSession() as s, s.ws_connect(url.replace("http", "ws", 1) + "/api/websocket") as ws:
+        await ws.receive_json()
+        await ws.send_json({"type": "auth", "access_token": token})
+        if (await ws.receive_json()).get("type") != "auth_ok":
+            sys.exit("--hass: HA refused the token")
+        for i in range(0, len(sentences), 50):
+            await ws.send_json({"id": i + 1, "type": "conversation/agent/homeassistant/debug",
+                                "sentences": sentences[i:i + 50] or [""], "language": language})
+            r = await ws.receive_json()
+            for res in (r.get("result") or {}).get("results") or [None] * len(sentences[i:i + 50]):
+                if not res:
+                    out.append(None)
+                    continue
+                # a slot is {"value": ..., "text": ...}, or for some intents just its value
+                slots = tuple(sorted((k, json.dumps(v.get("value") if isinstance(v, dict) else v,
+                                                    sort_keys=True).lower())
+                                     for k, v in (res.get("slots") or {}).items()))
+                out.append((res["intent"]["name"], slots, bool(res.get("match"))))
+    return out
+
+
+async def add_intents(clips: list, language: str) -> None:
+    unwake = lambda s: re.sub(rf"^\s*{WAKE}[\s,.!?;:]+", "", s, flags=re.I).strip()
+    sents = [unwake(c["text"]) for c in clips] + [unwake(c["hyp"]) for c in clips]
+    res = await hass_understands(sents, language)
+    for c, ref, hyp in zip(clips, res[:len(clips)], res[len(clips):]):
+        # only where HA understands what was really said; a hit = the same intent and names, fully matched
+        c["intent_ok"] = (hyp == ref) if ref and ref[2] else None
 
 
 def summary(run: dict) -> dict:
@@ -252,6 +305,8 @@ def summary(run: dict) -> dict:
     return {"n": len(c), "exact": 100 * sum(x["exact"] for x in c) / len(c),
             "wer": 100 * sum(x["errors"] for x in c) / max(1, sum(x["ref_words"] for x in c)),
             "names": f"{100 * sum(x['name_ok'] for x in named) / len(named):.0f}%" if named else "-",
+            "intent": (lambda k: f"{100 * sum(x['intent_ok'] for x in k) / len(k):.0f}% of {len(k)}" if k else "-")(
+                [x for x in c if x.get("intent_ok") is not None]),
             "ms": statistics.median(ms) if ms else float("nan")}
 
 
@@ -264,8 +319,10 @@ def cmd_report(a):
     sets = list(dict.fromkeys((x["dataset"], x["condition"]) for x in runs))
     by = {(f"{x['tag']} {x['system']}", x["dataset"], x["condition"]): summary(x) for x in runs}
     for metric, title, fmt in (("exact", "Exactly right (%)", "{:.1f}"), ("wer", "Word error rate (%)", "{:.1f}"),
-                               ("names", "Names right", "{}"), ("ms", "Median latency (ms)", "{:.0f}")):
-        if metric == "names" and all(by[k]["names"] == "-" for k in by):
+                               ("names", "Names right", "{}"),
+                               ("intent", "Home Assistant understood it as said (of the clips it understands)", "{}"),
+                               ("ms", "Median latency (ms)", "{:.0f}")):
+        if metric in ("names", "intent") and all(by[k][metric] == "-" for k in by):
             continue
         print(f"\n### {title}\n")
         print("| dataset | " + " | ".join(cols) + " |")
@@ -285,9 +342,10 @@ def cmd_diff(a):
         y = runs[(a.b, ds, cond)]
         summary(x), summary(y)
         for p, q in zip(x["clips"], y["clips"]):
-            if p["exact"] != q["exact"] or p.get("name_ok") != q.get("name_ok"):
-                good = p["exact"] or p.get("name_ok")
-                print(f"{ds}, {cond}: {'only ' + a.a if good else 'only ' + a.b} right: {p['text']!r}\n"
+            # better = exactly right, else at least the name right
+            rank_p, rank_q = (p["exact"], bool(p.get("name_ok"))), (q["exact"], bool(q.get("name_ok")))
+            if rank_p != rank_q:
+                print(f"{ds}, {cond}: {a.a if rank_p > rank_q else a.b} better: {p['text']!r}\n"
                       f"    {a.a}: {p['hyp']!r}\n    {a.b}: {q['hyp']!r}")
 
 
@@ -301,6 +359,8 @@ def main():
     r.add_argument("--noise", type=float)
     r.add_argument("--language", default="en")
     r.add_argument("--limit", type=int, help="only the first N clips of each dataset")
+    r.add_argument("--hass", action="store_true",
+                   help="also score whether Home Assistant understands each transcript as the truth (intent)")
     r.add_argument("--realtime", action="store_true",
                    help="stream audio to Wyoming servers at speaking pace, as a satellite does (slower)")
     r.add_argument("--out")

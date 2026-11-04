@@ -13,7 +13,7 @@ services:
     volumes:
       - ./data/models:/root/.cache
     command: >-
-      -hf ${LIGHT_MODEL:-ggml-org/Qwen3-ASR-0.6B-GGUF:Q8_0} -c 4096 -np 1
+      -hf ${LIGHT_MODEL:-ggml-org/Qwen3-ASR-0.6B-GGUF:Q8_0} -c 8192 -np 2
       --host 0.0.0.0 --port 8080 ${LLAMA_ARGS:-}
     ports:
       - "127.0.0.1:${LLAMA_PORT:-8120}:8080"   # only for bench/; HA never talks to it
