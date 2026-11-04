@@ -10,6 +10,8 @@ Environment=BACKEND=llamacpp LLAMA_URL=http://127.0.0.1:8080 BIAS_FILE=/var/lib/
 Environment=COMMANDS_FILE=/etc/assist-asr/commands.txt VOCAB_FILE=/etc/assist-asr/vocab.txt
 WorkingDirectory=/opt/assist-asr
 ExecStart=/opt/assist-asr/venv/bin/python -u /opt/assist-asr/server.py
+StandardOutput=journal+console
+StandardError=journal+console
 Restart=always
 RestartSec=5
 

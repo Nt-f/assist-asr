@@ -185,8 +185,9 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nt-f/assist-asr/main/pro
 
 It asks for Home Assistant's address and token, the model, and whether to share the GPU (or "advanced" for
 the id, storage, bridge, cores, memory and disk). It then downloads the template from the latest release
-(~250 MB, checked against its SHA-256), creates the container, and prints its address for the Wyoming
-integration. Settings live in the container's `/etc/assist-asr/assist-asr.env`.
+(~250 MB, checked against its SHA-256), creates the container, and prints its address. Home Assistant also discovers it by itself (mDNS): it
+shows up under Settings → Devices & services, ready to add. The container's Console in Proxmox shows the
+services' output. Settings live in the container's `/etc/assist-asr/assist-asr.env`.
 
 Without questions, e.g. for a script:
 
@@ -220,6 +221,7 @@ All of these go in `.env`. Restart with `docker compose up -d` after a change.
 | `WAKE_FORCE` | `auto` | When a transcript starts with what sounds like a mangled wake word ("Lex allowed her"), decode again with the wake phrase forced and keep that if the audio supports it. `off` turns it off. |
 | `ALTERNATIVES` | (off) | Experimental: an HA sensor (e.g. `sensor.asr_alternatives`) that gets what the request might also have been, for an LLM agent. See below. |
 | `WAKE_WORDS` | `alexa\|…\|nabu` | Wake words dropped from the start of a transcript ("hey"/"ok" in front of one too: Hey Jarvis, Okay Nabu). |
+| `ZEROCONF` | (off; `assist-asr` on Proxmox) | Announces the server by mDNS under this name, so Home Assistant discovers it. Only where the server is on the LAN itself (the Proxmox CT); not from Docker's default network. |
 | `RECORD_DIR` | `/data/rec` | Keeps every request's audio in `data/rec`, for building your own test set. Leave empty to turn it off. |
 
 The files in `config/` are reread every 10 minutes:

@@ -10,6 +10,8 @@ EnvironmentFile=/etc/assist-asr/assist-asr.env
 # the model is downloaded on first start into HOME's cache
 Environment=HOME=/var/lib/assist-asr
 ExecStart=/opt/assist-asr/run-llama.sh
+StandardOutput=journal+console
+StandardError=journal+console
 Restart=always
 RestartSec=5
 

@@ -142,7 +142,7 @@ VOL="$TSTORAGE:vztmpl/$FILE"
 create() {  # Proxmox sets up hostname and network itself for the OS types it knows
   pct create "$ID" "$VOL" --hostname assist-asr --cores "$CORES" --memory "$MEMORY" --swap 512 \
     --rootfs "$STORAGE:$DISK" --net0 "name=eth0,bridge=$BRIDGE,ip=dhcp" \
-    --unprivileged 1 --features nesting=1 --onboot 1 --ostype "$1"
+    --unprivileged 1 --features nesting=1 --onboot 1 --cmode console --ostype "$1"
 }
 say "creating CT $ID"
 ERR=$(mktemp)
@@ -187,9 +187,9 @@ done
 HOST=${IP:-"<the CT's address>"}
 cat <<MSG
 
-CT $ID is up${IP:+ at $IP}. The model downloads on first start (1-2.5 GB): watch it with
-  pct exec $ID -- journalctl -fu assist-asr-llama -u assist-asr-wyoming
+CT $ID is up${IP:+ at $IP}. The model downloads on first start (1-2.5 GB): watch it in the CT's Console
+(Proxmox's web UI), or with  pct exec $ID -- journalctl -fu assist-asr-llama -u assist-asr-wyoming
 It's ready once the log says "listening on 10300". Then in Home Assistant: Settings -> Devices & services ->
 Add integration -> Wyoming Protocol -> host $HOST, port 10300.
-Settings: pct exec $ID -- nano /etc/assist-asr/assist-asr.env (then restart both services).
+Settings: pct exec $ID -- nano /etc/assist-asr/assist-asr.env (then restart both services). A shell: pct enter $ID
 MSG

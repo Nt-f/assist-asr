@@ -13,7 +13,7 @@ RUN apt-get update \
  && (getent group render >/dev/null && groupmod -g 993 render || groupadd -g 993 render) \
  && useradd --system --home-dir /var/lib/assist-asr --create-home --groups render,video assist-asr \
  && python3 -m venv /opt/assist-asr/venv \
- && /opt/assist-asr/venv/bin/pip install --no-cache-dir wyoming==1.10.2 pysilero-vad==3.4.0
+ && /opt/assist-asr/venv/bin/pip install --no-cache-dir wyoming==1.10.2 zeroconf==0.151.5 pysilero-vad==3.4.0
 
 COPY wyoming/server.py plugin/asr_bias.py /opt/assist-asr/
 COPY config/commands.txt config/vocab.txt /etc/assist-asr/
@@ -23,6 +23,8 @@ COPY proxmox/rootfs/ /
 RUN chmod 600 /etc/assist-asr/assist-asr.env \
  && systemctl enable assist-asr-llama assist-asr-wyoming systemd-networkd systemd-resolved \
  && systemctl mask systemd-networkd-wait-online.service \
+ # the console (Proxmox: Console, cmode console) shows the services' output, not a login prompt
+ && systemctl mask console-getty.service \
  && echo assist-asr > /etc/hostname \
  # the image finds llama.cpp's libraries through Docker's ENV, which a root filesystem does not keep
  && echo /app > /etc/ld.so.conf.d/llama-cpp.conf && ldconfig \

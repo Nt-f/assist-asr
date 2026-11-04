@@ -25,6 +25,7 @@ Environment (defaults):
   ALTERNATIVES (unset; e.g. sensor.asr_alternatives: close alternatives for an LLM agent), ALT_RANGE (6)
   WAKE_WORDS (alexa|alexis|alex|amazon|computer|echo|ziggy|jarvis|mycroft|nabu; "hey"/"ok" before one is dropped too)
   VAD_THRESHOLD (0.3), MIN_SPEECH_MS (150), PAD_MS (300)
+  ZEROCONF (unset; a name, e.g. assist-asr): announce by mDNS for HA's discovery (needs the zeroconf package)
   RECORD_DIR (unset): keep each request's audio + transcript there (bench/label.py turns them
   into a dataset)
 """
@@ -73,6 +74,7 @@ HASS_DOMAINS = set(os.environ.get(
 CONTEXT_MAX = int(os.environ.get("CONTEXT_MAX_CHARS", "1500"))
 CONTEXT_REFRESH = float(os.environ.get("CONTEXT_REFRESH", "600"))
 PORT = int(os.environ.get("PORT", "10300"))
+ZEROCONF = os.environ.get("ZEROCONF", "")  # a name: announce this server by mDNS for HA's discovery
 VOCAB_FILE = os.environ.get("VOCAB_FILE", "/config/vocab.txt")
 VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.3"))
 MIN_SPEECH_MS = int(os.environ.get("MIN_SPEECH_MS", "150"))
@@ -1024,6 +1026,25 @@ async def warm_up():
             await asyncio.sleep(5)  # vLLM still starting
 
 
+async def announce():
+    """mDNS (_wyoming._tcp), so Home Assistant finds this server by itself (ZEROCONF: the name it shows).
+    Only on the LAN's own network (Proxmox CT, Docker's host network); retried until the CT has an address."""
+    try:
+        from wyoming.zeroconf import HomeAssistantZeroconf
+    except ImportError:
+        log.warning("ZEROCONF is set but the zeroconf package is missing (pip install zeroconf)")
+        return
+    while True:
+        try:
+            zc = HomeAssistantZeroconf(port=PORT, name=ZEROCONF)
+            await zc.register_server()
+            log.info("announced as %s (%s:%d) by mDNS", ZEROCONF, zc.host, PORT)
+            return
+        except Exception as e:
+            log.warning("mDNS announcement failed (%s); retrying", e)
+            await asyncio.sleep(10)
+
+
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if load_cache():  # last time's names at once; HA asked in the background
@@ -1035,6 +1056,8 @@ async def main():
         asyncio.get_running_loop().create_task(_later(refresher, CONTEXT_REFRESH if ok else 30))
     await warm_up()
     log.info("listening on %d, %s", PORT, f"{BACKEND} at {LLAMA_URL}" if LLAMA else f"vLLM at {VLLM_URL}")
+    if ZEROCONF:
+        asyncio.get_running_loop().create_task(announce())
     await AsyncServer.from_uri(f"tcp://0.0.0.0:{PORT}").run(Handler)
 
 
