@@ -212,6 +212,11 @@ in `/app.old` and `/opt/assist-asr.old`, and if the new one can't run on the con
 Docker: `proxmox/build-template.sh`, then `install.sh --template assist-asr-light-<date>-amd64.tar.zst` on
 the host.
 
+If transcripts come back empty and the log says llama.cpp "returned no probabilities (NaN)", llama.cpp's GPU
+code computes garbage on that GPU. `proxmox/gpu-check.sh <id>` (on the host, like install.sh) tries its
+settings one by one and shows which work. On a Radeon 680M the default one (fusion) was the culprit; the
+container turns fusion off on every GPU.
+
 The template is llama.cpp's own base, Ubuntu 26.04. A Proxmox that doesn't know that release yet makes it
 an "unmanaged" container, which configures its own network by DHCP. It was tested by booting it under
 systemd on a PC with an iGPU passed in, but not yet on a Proxmox host.

@@ -530,7 +530,7 @@ def _lc_complete(wav: bytes, prompt_string: str, n_probs: int = 0, grammar: str 
     steps = _lc_post("/completion", body).get("completion_probabilities") or []
     if any(e.get("logprob") is None for e in steps):  # NaN in JSON: the backend computed garbage
         raise RuntimeError("llama.cpp returned no probabilities (NaN): its GPU backend fails on this "
-                           "GPU; DEVICE=cpu runs it on the CPU")
+                           "GPU; proxmox/gpu-check.sh finds settings that work, DEVICE=cpu runs it on the CPU")
     return steps
 
 
