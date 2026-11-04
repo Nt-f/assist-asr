@@ -1,0 +1,6 @@
+# DHCP on the CT's network card; Proxmox writes its own when it manages the OS, this covers "unmanaged".
+[Match]
+Name=eth0
+
+[Network]
+DHCP=yes

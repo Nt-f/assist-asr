@@ -1,0 +1,54 @@
+# Speech to text for Home Assistant: Qwen3-ASR on vLLM (GPU) + a Wyoming server in front of it.
+# Settings in .env (copy .env.example). Home Assistant: Wyoming Protocol, this host, port 10300.
+services:
+  vllm:
+    # vllm-slim/: vLLM 0.31.0 with what this server loads, 7.8 GB unpacked (the official image: 22 GB;
+    # to use that instead, add -f compose.official.yml)
+    image: assist-asr-vllm-slim:0.31.0
+    build: ./vllm-slim
+    restart: unless-stopped
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "127.0.0.1:${VLLM_PORT:-8100}:8000"   # only for bench/ (the "stock" runs); HA never talks to it
+    volumes:
+      - ${HF_CACHE:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+      - ./plugin:/plugin:ro
+      - ./data:/data:ro
+    environment:
+      PYTHONPATH: /plugin
+    command: >-
+      --model ${ASR_MODEL:-Qwen/Qwen3-ASR-1.7B} --served-model-name qwen3-asr
+      --gpu-memory-utilization ${GPU_MEMORY:-0.26} --max-model-len 4096
+      --logits-processors asr_bias:AsrBias
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      start_period: 300s
+
+  wyoming:
+    build:
+      context: .
+      dockerfile: wyoming/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      vllm:
+        condition: service_healthy
+    ports:
+      - "${WYOMING_PORT:-10300}:10300"
+    env_file: .env
+    environment:
+      VLLM_URL: http://vllm:8000
+    healthcheck:  # listening once warmed up (the plugin's first request takes some seconds)
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 10300), 2)"]
+      interval: 5s
+      start_period: 120s
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data

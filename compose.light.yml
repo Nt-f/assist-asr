@@ -1,0 +1,45 @@
+# The light version: llama.cpp instead of vLLM (~1.2 GB runtime + a 1-2.5 GB model; x86 and ARM).
+# CPU by default; on an NVIDIA GPU add compose.light.cuda.yml, on an AMD/Intel GPU or iGPU compose.light.vulkan.yml:
+#   docker compose -f compose.light.yml up -d
+#   docker compose -f compose.light.yml -f compose.light.vulkan.yml up -d
+# LIGHT_MODEL (.env): ggml-org/Qwen3-ASR-0.6B-GGUF:Q8_0 (default; best on a CPU) or ggml-org/Qwen3-ASR-1.7B-GGUF:Q8_0.
+# The model is downloaded on first start into data/models.
+name: assist-asr-light
+services:
+  llama:
+    image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
+    restart: unless-stopped
+    cpuset: ${CPU_CORES:-}   # e.g. 0-3; then also LLAMA_ARGS=-t 4 (llama.cpp counts the machine's cores)
+    volumes:
+      - ./data/models:/root/.cache
+    command: >-
+      -hf ${LIGHT_MODEL:-ggml-org/Qwen3-ASR-0.6B-GGUF:Q8_0} -c 4096 -np 1
+      --host 0.0.0.0 --port 8080 ${LLAMA_ARGS:-}
+    ports:
+      - "127.0.0.1:${LLAMA_PORT:-8120}:8080"   # only for bench/; HA never talks to it
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      start_period: 600s   # the first start downloads the model
+
+  wyoming:
+    build:
+      context: .
+      dockerfile: wyoming/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      llama:
+        condition: service_healthy
+    ports:
+      - "${WYOMING_PORT:-10300}:10300"
+    env_file: .env
+    environment:
+      BACKEND: llamacpp
+      LLAMA_URL: http://llama:8080
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 10300), 2)"]
+      interval: 5s
+      start_period: 120s

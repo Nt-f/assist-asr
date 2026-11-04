@@ -1,0 +1,6 @@
+# vLLM's official image instead of the slim build (with docker-compose.yml): 22 GB unpacked, everything vLLM
+# can do. Same results here (measured: bench/), so only for trying other models or vLLM options.
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.31.0
+    build: !reset null

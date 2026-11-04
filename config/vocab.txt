@@ -1,0 +1,59 @@
+# Words a voice assistant hears that speech to text gets wrong without context.
+# One entry a line; edit freely, the server rereads this every 10 minutes.
+# Keep it to words you say: every name here is one the model may "hear" in a mumble.
+
+# The assistant itself
+Alexa
+Home Assistant
+Drop In
+Music Assistant
+
+# Timers and alarms
+set a timer
+timer
+alarm
+snooze
+cancel the timer
+how long is left
+wake me up
+
+# Music and media
+pause
+resume
+skip
+next track
+previous track
+shuffle
+repeat
+volume up
+volume down
+mute
+unmute
+playlist
+album
+podcast
+radio
+
+# Home
+turn on
+turn off
+brightness
+dim
+thermostat
+heating
+air conditioning
+humidity
+degrees
+percent
+blinds
+curtains
+garage door
+lock the door
+unlock
+vacuum
+
+# Questions
+what time is it
+weather
+forecast
+temperature outside

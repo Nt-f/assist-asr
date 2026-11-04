@@ -1,0 +1,75 @@
+# What a request starts with: the words decoding is pushed towards at the start of a request
+# (after the wake word). "> music" or "> home" after a phrase: what follows it is a name from that
+# list (music = Music Assistant's library, home = HA's entity and area names), pushed towards those.
+# Reread every 10 minutes; one phrase a line, # comments.
+
+# Music
+play > music
+shuffle > music
+play some > music
+put on > music
+listen to > music
+pause
+resume
+stop
+stop the music
+stop playing
+pause the music
+resume the music
+skip
+skip this song
+next
+next song
+next track
+previous
+previous song
+go back
+volume up
+volume down
+turn it up
+turn it down
+louder
+quieter
+mute
+unmute
+what's playing
+what song is this
+
+# Home
+turn on > home
+turn off > home
+switch on > home
+switch off > home
+dim > home
+brighten > home
+open > home
+close > home
+lock > home
+unlock > home
+lights
+lights on
+lights off
+set the temperature to
+set the brightness to
+
+# Timers and alarms
+set a timer for
+set a timer
+start a timer for
+cancel the timer
+stop the timer
+how much time is left
+how long is left on the timer
+set an alarm for
+wake me up at
+snooze
+
+# Questions
+what time is it
+what's the time
+what's the weather
+what's the temperature
+what is the weather
+is it going to rain
+what day is it
+what's the date

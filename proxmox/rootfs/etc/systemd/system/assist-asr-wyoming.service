@@ -1,0 +1,17 @@
+[Unit]
+Description=assist-asr: Wyoming speech-to-text for Home Assistant
+After=assist-asr-llama.service
+Wants=assist-asr-llama.service
+
+[Service]
+User=assist-asr
+EnvironmentFile=/etc/assist-asr/assist-asr.env
+Environment=BACKEND=llamacpp LLAMA_URL=http://127.0.0.1:8080 BIAS_FILE=/var/lib/assist-asr/bias.json
+Environment=COMMANDS_FILE=/etc/assist-asr/commands.txt VOCAB_FILE=/etc/assist-asr/vocab.txt
+WorkingDirectory=/opt/assist-asr
+ExecStart=/opt/assist-asr/venv/bin/python -u /opt/assist-asr/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

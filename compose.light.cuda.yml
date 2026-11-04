@@ -1,0 +1,14 @@
+# NVIDIA GPU for the light version (with compose.light.yml).
+services:
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    command: >-
+      -hf ${LIGHT_MODEL:-ggml-org/Qwen3-ASR-0.6B-GGUF:Q8_0} -c 4096 -np 1 -ngl 99
+      --host 0.0.0.0 --port 8080 ${LLAMA_ARGS:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
