@@ -4,12 +4,13 @@
 #
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nt-f/assist-asr/main/proxmox/install.sh)"
 #
-# It asks for the settings, or takes them as options: --help.
+# It asks for the settings, or takes them as options: --help. To update a CT it made, the same with
+# --update <id> at the end:  bash -c "$(curl ...)" -- --update 105
 set -euo pipefail
 
 REPO=Nt-f/assist-asr
 TEMPLATE="" VERSION="" ID="" STORAGE="" TSTORAGE="" BRIDGE=vmbr0 CORES=4 MEMORY=4096 DISK=8 MODEL=0.6B GPU=auto
-HASS_URL="" HASS_TOKEN="" YES=0
+HASS_URL="" HASS_TOKEN="" YES=0 UPDATE=""
 
 usage() { cat <<'EOF_HELP'
 It asks for the settings. Or pass them, with --yes to skip the questions (after `bash -s --` when piped):
@@ -30,6 +31,10 @@ It asks for the settings. Or pass them, with --yes to skip the questions (after 
   --version TAG       a release (default: the latest)
   --template FILE     a template built with proxmox/build-template.sh, instead of a release's
   --yes               no questions
+
+  --update ID         update that CT (made by this script) to the latest release, or --version's: llama.cpp,
+                      the server and its services. Its settings, names, downloaded model, address and Proxmox
+                      config stay; the previous version is kept, and put back if the new one does not start.
 EOF_HELP
 }
 say() { printf '\e[1;36m==>\e[0m %s\n' "$*"; }
@@ -51,6 +56,7 @@ while [ $# -gt 0 ]; do
     --hass-url) HASS_URL=$2; shift 2 ;;
     --hass-token) HASS_TOKEN=$2; shift 2 ;;
     -y|--yes) YES=1; shift ;;
+    --update) UPDATE=$2; YES=1; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option $1 (--help)" ;;
   esac
@@ -71,7 +77,7 @@ STORAGE=${STORAGE:-$(pick rootdir local-lvm local-zfs)}
 TSTORAGE=${TSTORAGE:-$(pick vztmpl local)}
 [ -n "$STORAGE" ] || die "no storage takes CT disks (pvesm status -content rootdir)"
 [ -n "$TSTORAGE" ] || die "no storage takes CT templates (pvesm status -content vztmpl)"
-ID=${ID:-$(pvesh get /cluster/nextid)}
+ID=${UPDATE:-${ID:-$(pvesh get /cluster/nextid)}}
 HAS_GPU=0; [ -e /dev/dri/renderD128 ] && HAS_GPU=1
 
 # ---- questions (whiptail, as Proxmox has it) -------------------------------------------------------------
@@ -109,7 +115,14 @@ fi
 
 case "$MODEL" in 0.6B|1.7B) ;; *) die "--model 0.6B or 1.7B" ;; esac
 case "$GPU" in auto|yes|no) ;; *) die "--gpu auto, yes or no" ;; esac
-pct status "$ID" >/dev/null 2>&1 && die "CT $ID exists already"
+if [ -n "$UPDATE" ]; then
+  pct status "$ID" >/dev/null 2>&1 || die "no CT $ID"
+  [ "$(pct status "$ID")" = "status: running" ] || { say "starting CT $ID"; pct start "$ID"; sleep 5; }
+  pct exec "$ID" -- test -f /etc/assist-asr/assist-asr.env || die "CT $ID is not an assist-asr CT"
+  CURRENT=$(pct exec "$ID" -- cat /etc/assist-asr/version 2>/dev/null || echo "an older one")
+else
+  pct status "$ID" >/dev/null 2>&1 && die "CT $ID exists already"
+fi
 
 # ---- the template -----------------------------------------------------------------------------------------
 if [ -n "$TEMPLATE" ]; then
@@ -137,6 +150,57 @@ else
   fi
 fi
 VOL="$TSTORAGE:vztmpl/$FILE"
+
+# ---- update: the app's files from the template into the running CT ------------------------------------------
+if [ -n "$UPDATE" ]; then
+  NEWVER=${VERSION:-$FILE}
+  [ "$CURRENT" != "$NEWVER" ] || { say "CT $ID has $NEWVER already"; exit 0; }
+  say "updating CT $ID: $CURRENT -> $NEWVER"
+  STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
+  # what the release changes: llama.cpp (/app), the server and its venv, the services and the default settings
+  tar -x --zstd -f "$DEST" -C "$STAGE" --numeric-owner -p \
+    'app' 'opt/assist-asr' 'etc/assist-asr' 'etc/systemd/system' 'etc/ld.so.conf.d/llama-cpp.conf' \
+    'etc/tmpfiles.d/assist-asr-resolv.conf'
+  echo "$NEWVER" > "$STAGE/etc/assist-asr/version"
+  pct exec "$ID" -- sh -c 'rm -rf /var/tmp/assist-asr-new && mkdir -p /var/tmp/assist-asr-new'
+  tar -C "$STAGE" --numeric-owner -cf - . | pct exec "$ID" -- tar -x -p --numeric-owner -f - -C /var/tmp/assist-asr-new
+  pct exec "$ID" -- bash -s <<'IN_CT'
+set -euo pipefail
+N=/var/tmp/assist-asr-new
+systemctl stop assist-asr-wyoming assist-asr-llama
+swap_in() { for d in /app /opt/assist-asr; do rm -rf "$d.old"; mv "$d" "$d.old"; mv "$N$d" "$d"; done; }
+put_back() { for d in /app /opt/assist-asr; do rm -rf "$d"; mv "$d.old" "$d"; done; }
+swap_in
+# the new llama-server and Python have to run on this CT's system (a release on a newer base cannot)
+if ! /opt/assist-asr/venv/bin/python -c 'import wyoming, pysilero_vad' 2>/dev/null \
+   || ! LD_LIBRARY_PATH=/app /app/llama-server --version >/dev/null 2>&1; then
+  put_back; rm -rf "$N"; systemctl start assist-asr-llama assist-asr-wyoming
+  echo "this release does not run on this CT's system: kept the previous version; reinstall the CT instead" >&2
+  exit 3
+fi
+cp -a "$N/etc/systemd/system/." /etc/systemd/system/
+cp -a "$N/etc/ld.so.conf.d/llama-cpp.conf" /etc/ld.so.conf.d/ && ldconfig
+cp -a "$N/etc/tmpfiles.d/assist-asr-resolv.conf" /etc/tmpfiles.d/
+# the lists go with the server's version; edited ones are kept beside them as .bak
+for f in commands.txt vocab.txt; do
+  cmp -s "$N/etc/assist-asr/$f" "/etc/assist-asr/$f" || { cp -a "/etc/assist-asr/$f" "/etc/assist-asr/$f.bak" 2>/dev/null || true; cp -a "$N/etc/assist-asr/$f" /etc/assist-asr/; }
+done
+# settings: yours stay; the release's new ones are added with their defaults
+E=/etc/assist-asr/assist-asr.env
+grep -E '^[A-Z_]+=' "$N/etc/assist-asr/assist-asr.env" | while IFS= read -r line; do
+  grep -q "^${line%%=*}=" "$E" || { echo "added setting: $line"; printf '%s\n' "$line" >> "$E"; }
+done
+cp "$N/etc/assist-asr/version" /etc/assist-asr/version
+systemctl daemon-reload
+systemctl start assist-asr-llama assist-asr-wyoming
+rm -rf "$N"
+IN_CT
+  # the Console shows the services' output (CTs made before that was on)
+  pct set "$ID" --cmode console
+  say "CT $ID: $NEWVER. The services restarted; their output is on its Console. The previous version is in"
+  echo "    /app.old and /opt/assist-asr.old inside the CT, until the next update."
+  exit 0
+fi
 
 # ---- the CT -------------------------------------------------------------------------------------------------
 create() {  # Proxmox sets up hostname and network itself for the OS types it knows

@@ -18,6 +18,8 @@ RUN apt-get update \
 COPY wyoming/server.py plugin/asr_bias.py /opt/assist-asr/
 COPY config/commands.txt config/vocab.txt /etc/assist-asr/
 COPY proxmox/rootfs/ /
+# the release (install.sh --update compares it)
+ARG VERSION=dev
 
 # the settings file holds the HA token: root's only (systemd reads it before dropping to assist-asr)
 RUN chmod 600 /etc/assist-asr/assist-asr.env \
@@ -26,6 +28,7 @@ RUN chmod 600 /etc/assist-asr/assist-asr.env \
  # the console (Proxmox: Console, cmode console) shows the services' output, not a login prompt
  && systemctl mask console-getty.service \
  && echo assist-asr > /etc/hostname \
+ && echo "$VERSION" > /etc/assist-asr/version \
  # the image finds llama.cpp's libraries through Docker's ENV, which a root filesystem does not keep
  && echo /app > /etc/ld.so.conf.d/llama-cpp.conf && ldconfig \
  # the image's own entrypoint is llama-server; a CT boots systemd

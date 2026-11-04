@@ -196,6 +196,17 @@ curl -fsSL https://raw.githubusercontent.com/Nt-f/assist-asr/main/proxmox/instal
     --hass-url http://192.168.1.10:8123 --hass-token <token> [--model 1.7B] [--gpu no]
 ```
 
+To update it to the latest release later, the same with `--update` and the container's id:
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nt-f/assist-asr/main/proxmox/install.sh)" -- --update 105
+```
+
+That replaces llama.cpp, the server and its services inside the container and restarts them. Your settings,
+the names, the downloaded model, the container's address and its Proxmox config stay; settings a release adds
+come with their defaults, and edited `commands.txt`/`vocab.txt` are kept as `.bak`. The previous version stays
+in `/app.old` and `/opt/assist-asr.old`, and if the new one can't run on the container's system it's put back.
+
 `--help` lists every option. The template is built by GitHub Actions
 (`.github/workflows/proxmox-template.yml`) for each `v*` tag. To build one yourself, on any machine with
 Docker: `proxmox/build-template.sh`, then `install.sh --template assist-asr-light-<date>-amd64.tar.zst` on

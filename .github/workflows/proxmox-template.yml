@@ -19,7 +19,7 @@ jobs:
       - name: Build the template
         run: |
           command -v zstd >/dev/null || { sudo apt-get update && sudo apt-get install -y zstd; }
-          NAME=assist-asr-light-amd64 proxmox/build-template.sh
+          NAME=assist-asr-light-amd64 VERSION=$GITHUB_REF_NAME proxmox/build-template.sh
           cd dist && sha256sum assist-asr-light-amd64.tar.zst > assist-asr-light-amd64.tar.zst.sha256
 
       - name: Attach it to the release
