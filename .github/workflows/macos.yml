@@ -1,4 +1,4 @@
-# macos/install.sh on a real Mac (GitHub's Apple silicon runner): installs, starts both services under launchd,
+# macos/install.sh on a real Mac (GitHub's Apple silicon runner, macos-latest): installs, starts both services under launchd,
 # and transcribes a request macOS's own voice says. Whether llama.cpp got Metal there is in the summary
 # (GitHub's Mac runners are virtual machines; where Metal isn't offered, llama.cpp runs on the CPU and this still
 # checks the install).
@@ -11,7 +11,7 @@ on:
 
 jobs:
   install:
-    runs-on: macos-14
+    runs-on: macos-latest   # Apple silicon
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
