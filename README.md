@@ -94,6 +94,22 @@ It asks for Home Assistant's address and token, the model, and whether to share 
 then creates the container and prints its address. Home Assistant discovers it by itself (Settings → Devices &
 services). Updates, scripted installs and GPU trouble: "Proxmox in detail" under More about the versions.
 
+### On a Mac (Metal)
+
+Docker on a Mac can't use the GPU, so there the light version runs on the CPU only. For the Apple silicon GPU,
+install it natively: Homebrew's llama.cpp (built with Metal) and the Wyoming server, kept running by launchd.
+Needs [Homebrew](https://brew.sh). In Terminal:
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nt-f/assist-asr/main/macos/install.sh)"
+```
+
+It asks for Home Assistant's address and token and the model (1.7B by default: on Metal the more accurate one is
+fast too), installs, starts both services and prints the Mac's address. Home Assistant discovers it by itself.
+Settings are in `~/Library/Application Support/assist-asr/assist-asr.env`, logs in `~/Library/Logs/assist-asr`;
+`macos/install.sh --update` updates, `--uninstall` removes it. The services run while you're logged in: on a Mac
+that's always on, turn on automatic login.
+
 ## Results
 
 Measured on an RTX 3090 and a Ryzen 9 7900X (12 cores), against the same model with nothing
@@ -367,6 +383,12 @@ The files in `config/` are reread every 10 minutes:
 `1.9 s audio, 1536 ms speech, 99 ms (vad 0, decode 99, name check 0): 'Alexa, play X.' -> 'Play X.'`.
 A `name check` line shows the scores whenever a name was weighed against your list.
 
+**Is it up?** The server's port answering says nothing about the model server behind it (llama-server or vLLM):
+that one can be gone while every request comes back empty. Docker's healthcheck runs `server.py --health`, which
+asks both, so `docker ps` shows the container unhealthy then. A monitor can ask the same over Wyoming: send the
+event `asr-health` and the answer is `asr-health` with `{"ok": true|false, "backend": "llamacpp"}`. Home
+Assistant never sends it.
+
 ## Alternatives for your LLM (experimental)
 
 <details><summary>How to use it</summary>
@@ -528,6 +550,7 @@ compose.light.yml    the light version: llama.cpp + the Wyoming server, CPU
 compose.light.cuda.yml, compose.light.vulkan.yml   ... on an NVIDIA GPU, on an AMD/Intel GPU or iGPU
 vllm-slim/           the small vLLM image (what a Qwen3-ASR server loads, nothing else)
 proxmox/             install.sh (run on the host), build-template.sh, the CT's services (rootfs/)
+macos/               install.sh: the light version on a Mac, on Metal (Homebrew's llama.cpp, launchd)
 engine/              asr-engine: llama.cpp's library, one batched pass per name check (compose.engine.yml)
 .env.example         settings (copy to .env)
 config/              commands.txt, vocab.txt, optional music.txt and home.txt

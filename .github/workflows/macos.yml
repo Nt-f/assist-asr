@@ -1,0 +1,58 @@
+# macos/install.sh on a real Mac (GitHub's Apple silicon runner): installs, starts both services under launchd,
+# and transcribes a request macOS's own voice says. Whether llama.cpp got Metal there is in the summary
+# (GitHub's Mac runners are virtual machines; where Metal isn't offered, llama.cpp runs on the CPU and this still
+# checks the install).
+name: macOS (Metal)
+
+on:
+  push:
+    paths: ['macos/**', 'wyoming/server.py', 'plugin/asr_bias.py', '.github/workflows/macos.yml']
+  workflow_dispatch:
+
+jobs:
+  install:
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: macos/install.sh --yes --model 0.6B
+
+      - name: A spoken request through Wyoming
+        run: |
+          say -o req.aiff "Turn on the kitchen light."
+          afconvert -f WAVE -d LEI16@16000 -c 1 req.aiff req.wav
+          APP="$HOME/Library/Application Support/assist-asr"
+          "$APP/venv/bin/python" - <<'EOF'
+          import asyncio, wave
+          from wyoming.asr import Transcribe, Transcript
+          from wyoming.audio import AudioChunk, AudioStart, AudioStop
+          from wyoming.client import AsyncTcpClient
+          async def main():
+              w = wave.open("req.wav"); pcm = w.readframes(w.getnframes())
+              async with AsyncTcpClient("127.0.0.1", 10300) as c:
+                  await c.write_event(Transcribe(language="en").event())
+                  await c.write_event(AudioStart(rate=16000, width=2, channels=1).event())
+                  for i in range(0, len(pcm), 3200):
+                      await c.write_event(AudioChunk(rate=16000, width=2, channels=1, audio=pcm[i:i + 3200]).event())
+                  await c.write_event(AudioStop().event())
+                  while True:
+                      e = await c.read_event()
+                      if Transcript.is_type(e.type):
+                          t = Transcript.from_event(e).text
+                          print("transcript:", repr(t))
+                          assert "kitchen light" in t.lower(), t
+                          return
+          asyncio.run(main())
+          EOF
+
+      - name: Metal or not
+        if: always()
+        run: |
+          L="$HOME/Library/Logs/assist-asr"
+          { echo "### llama.cpp on this runner"; echo '```'; grep -iE "metal|ggml_.*backend|using device|offload" "$L/llama.log" | head -20; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          tail -40 "$L/llama.log"; tail -20 "$L/wyoming.log"
+
+      - name: Uninstall
+        run: macos/install.sh --uninstall

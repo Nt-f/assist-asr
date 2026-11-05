@@ -1051,6 +1051,11 @@ class Handler(AsyncEventHandler):
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
             await self.write_event(INFO.event())
+        elif event.type == "asr-health":
+            # for a monitor (a Home Assistant sensor, a script): this server answering says nothing about its model server,
+            # which was gone for hours once while the port stayed open. Home Assistant never sends this.
+            ok = await asyncio.to_thread(health_backend)
+            await self.write_event(Event(type="asr-health", data={"ok": ok, "backend": BACKEND}))
         elif Transcribe.is_type(event.type):
             t = Transcribe.from_event(event)
             if t.language:
@@ -1249,6 +1254,14 @@ async def main():
     if ZEROCONF:
         asyncio.get_running_loop().create_task(announce())
     await AsyncServer.from_uri(f"tcp://0.0.0.0:{PORT}").run(Handler)
+
+
+def health_backend() -> bool:
+    try:
+        with urllib.request.urlopen((LLAMA_URL if LLAMA else VLLM_URL) + "/health", timeout=3):
+            return True
+    except Exception:
+        return False
 
 
 def health() -> int:
