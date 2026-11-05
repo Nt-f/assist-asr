@@ -40,6 +40,6 @@ services:
       - ./config:/config:ro
       - ./data:/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 10300), 2)"]
+      test: ["CMD", "python", "server.py", "--health"]   # also asks the model server
       interval: 5s
       start_period: 120s

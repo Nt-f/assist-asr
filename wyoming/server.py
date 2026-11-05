@@ -24,16 +24,21 @@ Environment (defaults):
   WAKE_FORCE (auto: a mangled wake word decoded again with it forced; off), WAKE_PRIOR (8), WAKE_PHRASES
   ALTERNATIVES (unset; e.g. sensor.asr_alternatives: close alternatives for an LLM agent), ALT_RANGE (6)
   WAKE_WORDS (alexa|alexis|alex|amazon|computer|echo|ziggy|jarvis|mycroft|nabu; "hey"/"ok" before one is dropped too)
-  VAD_THRESHOLD (0.3), MIN_SPEECH_MS (150), PAD_MS (300)
+  VAD_THRESHOLD (0.3), MIN_SPEECH_MS (150), PAD_MS (300), VAD_BOOST (30: dB a quiet request is raised by
+  for the VAD alone; 0 off); the short path under SURE_MS (300): SHORT_MS (96), SHORT_THRESHOLD (0.1),
+  SHORT_LP (-2); LLAMA_WAIT (20 s for a llama-server restarting)
   ZEROCONF (unset; a name, e.g. assist-asr): announce by mDNS for HA's discovery (needs the zeroconf package)
   RECORD_DIR (unset): keep each request's audio + transcript there (bench/label.py turns them
   into a dataset)
 """
 
+import array
 import asyncio
+import collections
 import base64
 import http.client
 import threading
+import urllib.error
 import urllib.parse
 import difflib
 import io
@@ -79,6 +84,13 @@ VOCAB_FILE = os.environ.get("VOCAB_FILE", "/config/vocab.txt")
 VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.3"))
 MIN_SPEECH_MS = int(os.environ.get("MIN_SPEECH_MS", "150"))
 PAD_MS = int(os.environ.get("PAD_MS", "300"))
+# Under the gate: a whole command only (config/commands.txt: "Stop.", "Next."), the model sure of it (SHORT_LP
+# nats), with at least SHORT_MS of windows at SHORT_THRESHOLD; 0 off.
+SHORT_MS = int(os.environ.get("SHORT_MS", "96"))
+SHORT_THRESHOLD = float(os.environ.get("SHORT_THRESHOLD", "0.1"))
+SURE_MS = int(os.environ.get("SURE_MS", "300"))  # less speech than this goes the short path's way too
+SHORT_LP = float(os.environ.get("SHORT_LP", "-2"))
+VAD_BOOST = float(os.environ.get("VAD_BOOST", "30"))  # dB at most a quiet request is raised by for the VAD; 0: off
 RECORD_DIR = os.environ.get("RECORD_DIR", "")
 USE_CONTEXT = os.environ.get("CONTEXT", "1") != "0"
 BIAS_FILE = (os.environ.get("BIAS_FILE", "/data/bias.json")
@@ -134,20 +146,81 @@ class StreamVad:
         self.n = self.vad.chunk_bytes()  # 512 samples, 32 ms
         self.pos = 0
         self.hits = []
+        self.weak = []  # windows at SHORT_THRESHOLD or more
+        self.quiet = False  # span(): its speech found only boosted
+        self.short = False  # span(): under the gate, but enough for a short command (SHORT_MS)
 
     def feed(self, pcm) -> None:
         while self.pos + self.n <= len(pcm):
-            if self.vad(bytes(pcm[self.pos:self.pos + self.n])) >= VAD_THRESHOLD:
+            p = self.vad(bytes(pcm[self.pos:self.pos + self.n]))
+            if p >= VAD_THRESHOLD:
                 self.hits.append(self.pos)
+            if p >= SHORT_THRESHOLD:
+                self.weak.append(self.pos)
             self.pos += self.n
 
-    def span(self, total: int):
-        """(start, end) in bytes of 16 kHz s16 mono or None below MIN_SPEECH_MS, and speech ms."""
+    def span(self, total: int, pcm=None):
+        """(start, end) in bytes of 16 kHz s16 mono or None below MIN_SPEECH_MS, and speech ms.
+        With pcm, a quiet request is looked at again at a normal level (boosted)."""
         ms = len(self.hits) * self.n // 32
-        if ms < MIN_SPEECH_MS:
-            return None, ms
+        if ms < SURE_MS and pcm is not None and VAD_BOOST > 0:
+            # only where the gate would say "nothing": a request it passes keeps its span (boosted, the
+            # span grew and 3 of 18 one-word clips at -30 dB came out worse)
+            self.boosted(pcm)
+            ms = len(self.hits) * self.n // 32
         pad = PAD_MS * 32
+        if ms < SURE_MS and ms >= MIN_SPEECH_MS:
+            # Just over the gate: as much noise as speech. White noise at -45..-50 dBFS got 160-192 ms, and
+            # with the context in the prompt came out "Alexa, set a timer." (read back); a quiet "Stop" at
+            # 256 ms cut to its span came out "Um.". The short path's rules for these too.
+            self.short = True
+            return (0, total), ms
+        if ms < MIN_SPEECH_MS:
+            # A command cut short (the replay after the wake word starting in it: "Stop" as "op") or said
+            # very quietly: Silero gives such a fragment 0-96 ms (issue #1), where plain Qwen3-ASR still hears
+            # "Stop". Decoded anyway, and the handler keeps only a whole command the model is sure of.
+            if SHORT_MS and len(self.weak) * 32 >= SHORT_MS:
+                self.short = True
+                return (0, total), ms
+            return None, ms
+        if self.quiet:
+            # Found only boosted, the span is too tight: quiet one-word clips cut to it came out "Um." for
+            # "Stop", "We." for "Resume", which the whole request (as plain Qwen3-ASR gets it) did not.
+            return (0, total), ms
         return (max(0, self.hits[0] - pad), min(total, self.hits[-1] + self.n + pad)), ms
+
+    def boosted(self, pcm) -> None:
+        """Silero's probabilities fall with the level: an Echo's own recordings turned down 30 dB (where
+        an Echo Dot 2's requests arrive, issue #1) kept 32-512 ms of 1.6-2.2 s of speech at 0.3, so "Stop",
+        "Next", "Pause" came back empty. Brought up to -6 dBFS (at most VAD_BOOST dB) the same clips kept
+        all but ~5 % of it, even at -40 dB, while noise alone (white/brown -70..-40 dBFS, the rooms' own
+        tails, hum) stayed at 0 ms. Only for requests the gate fails whose peak is under -12 dBFS: ~30 ms
+        for 5 s."""
+        a = array.array("h", bytes(pcm[:len(pcm) // 2 * 2]))
+        n = self.n // 2
+        peaks = sorted(max(max(a[i:i + n]), -min(a[i:i + n])) for i in range(0, len(a) - n + 1, n))
+        if len(peaks) < 2:
+            return
+        peak = max(peaks[-2], 1)  # the second loudest window: one click doesn't set the gain
+        gain_db = min(VAD_BOOST, -6 - 20 * math.log10(peak / 32768))
+        if gain_db < 6:
+            return
+        g = 10 ** (gain_db / 20)
+        b = array.array("h", (max(-32768, min(32767, int(x * g))) for x in a)).tobytes()
+        vad, hits, weak = SileroVoiceActivityDetector(), [], []
+        for pos in range(0, len(b) - self.n + 1, self.n):
+            p = vad(b[pos:pos + self.n])
+            if p >= VAD_THRESHOLD:
+                hits.append(pos)
+            if p >= SHORT_THRESHOLD:
+                weak.append(pos)
+        if len(weak) > len(self.weak):
+            self.weak = weak
+        if len(hits) > len(self.hits):
+            log.info("quiet request (+%.0f dB): %d ms of speech found, %d at its own level",
+                     gain_db, len(hits) * 32, len(self.hits) * 32)
+            self.hits = hits
+            self.quiet = True
 
 
 def echoes_context(text: str, ctx: str) -> bool:
@@ -155,9 +228,14 @@ def echoes_context(text: str, ctx: str) -> bool:
     if not ctx:
         return False
     t = " " + re.sub(r"[^a-z0-9]+", " ", text.lower()) + " "
-    entries = {re.sub(r"[^a-z0-9]+", " ", e.lower()).strip() for e in re.split(r"[,.]", ctx)}
-    found = sum(1 for e in entries if e and f" {e} " in t)
-    return found >= 3 and len(t.split()) > 8
+    order = [e for e in (re.sub(r"[^a-z0-9]+", " ", e.lower()).strip() for e in re.split(r"[,.]", ctx)) if e]
+    entries = set(order)
+    found = sum(1 for e in entries if f" {e} " in t)
+    if found >= 3 and len(t.split()) > 8:
+        return True
+    # Or short: three entries in a row as the context has them ("Home Assistant, Drop In, Music Assistant."),
+    # which no request says.
+    return any(f" {order[i]} {order[i + 1]} {order[i + 2]} " in t for i in range(len(order) - 2))
 
 
 def _hass(method: str, path: str, body=None):
@@ -487,21 +565,57 @@ def _vllm_force(wav: bytes, prompt: str, text: str) -> float:
 # All requests go to slot 0, one at a time: each slot caches separately, and a second one would encode
 # the audio again (on a CPU the costliest part).
 _lc = {"marker": None}
+# Where the audio goes in a prompt. llama-server makes its media marker up anew at every start
+# ("<__media_Z9xf6p...__>", GET /props), so prompts carry this stand-in and _lc_post puts the server's
+# current marker in just before sending. Cached once, a llama-server restarted under us (a crash, a driver
+# update, a new image) cost every request after it a 400 ("number of media markers in text (0) does not
+# match number of bitmaps (1)") until this server was restarted too (issue #1).
+MEDIA = "@@assist-asr-media@@"
+LLAMA_WAIT = float(os.environ.get("LLAMA_WAIT", "20"))  # s a request waits for a llama-server (re)starting
+
+
+def _lc_marker(fresh: bool = False) -> str:
+    if fresh or _lc["marker"] is None:
+        with urllib.request.urlopen(LLAMA_URL + "/props", timeout=10) as r:
+            _lc["marker"] = json.loads(r.read())["media_marker"]
+    return _lc["marker"]
 
 
 def _lc_post(path: str, body: dict) -> dict:
-    req = urllib.request.Request(LLAMA_URL + path, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.loads(r.read())
+    raw = json.dumps(body)
+    deadline = time.monotonic() + LLAMA_WAIT
+    fresh, retried = False, False
+    while True:
+        try:
+            data = raw.replace(MEDIA, json.dumps(_lc_marker(fresh))[1:-1]).encode()
+            fresh = False
+            req = urllib.request.Request(LLAMA_URL + path, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            msg = e.read().decode(errors="replace")
+            if e.code == 400 and not retried:
+                # A llama-server started since? Its error says "number of media markers ..." or only
+                # "Failed to tokenize prompt", by version: the marker asked again, retried once if new.
+                retried, old = True, _lc["marker"]
+                if _lc_marker(True) != old:
+                    log.warning("llama.cpp's media marker changed (restarted): retried with the new one")
+                    continue
+            if e.code == 503 and time.monotonic() < deadline:  # still loading the model
+                time.sleep(1)
+                continue
+            raise RuntimeError(f"llama.cpp {path}: HTTP {e.code}: {msg[:200]}") from None
+        except (urllib.error.URLError, ConnectionError) as e:
+            # down or starting (its marker will be new): wait a little, else fail this request
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"llama.cpp unreachable at {LLAMA_URL}: {e}") from None
+            fresh = True
+            time.sleep(1)
 
 
 def _lc_prompt(prompt: str, language: str) -> str:
-    if _lc["marker"] is None:
-        with urllib.request.urlopen(LLAMA_URL + "/props", timeout=10) as r:
-            _lc["marker"] = json.loads(r.read())["media_marker"]
     system = f"<|im_start|>system\n{prompt}<|im_end|>\n" if prompt else ""
-    return (f"{system}<|im_start|>user\n{_lc['marker']}<|im_end|>\n<|im_start|>assistant\n"
+    return (f"{system}<|im_start|>user\n{MEDIA}<|im_end|>\n<|im_start|>assistant\n"
             f"language {LANGUAGES.get(language, language)}<asr_text>")
 
 
@@ -695,12 +809,37 @@ def _hass_keep(method: str, path: str, body) -> None:
                     raise
 
 
+# Whether the last requests began with a wake word: does the satellite send it ("Wake word in the request")?
+_wake_seen = collections.deque(maxlen=20)
+
+
+# What Qwen3-ASR says to next to nothing: never a request on its own
+FILLER_WORDS = {"a", "ah", "uh", "um", "hmm", "mm", "oh", "okay", "ok", "yeah", "yes", "no", "you", "thank you",
+                "thanks", "bye", "so", "the", "i", "and", "huh", "hm"}
+
+
+def is_command(text: str) -> bool:
+    """A whole command of config/commands.txt ("Stop.", "next track"), wake word aside."""
+    t = asr_bias.norm(strip_wake(text)).strip()
+    if not t:
+        return False
+    cmds, openers = read_commands()
+    return t in {asr_bias.norm(c).strip() for c in cmds + list(openers)}
+
+
 def wake_guess(raw: str, toks) -> str:
     """The wake phrase a transcript without one probably starts with, mangled ("Lex allowed her",
     "Hey, Minecraft"), or "": by sound against its first words, or a wake word among the first token's
     alternatives."""
     if WAKE_FORCE == "off" or not raw or WAKE_RE.match(raw):
         return ""
+    if WAKE_FORCE == "auto" and len(_wake_seen) >= 5 and sum(_wake_seen) < len(_wake_seen) / 4:
+        # The satellite doesn't send the wake word (most don't): there is none to mend, and forcing one only
+        # made things up (issue #1's 99 requests without it were where assist-asr fell behind plain Qwen).
+        return ""
+    bias = asr_bias.load(BIAS_FILE) if BIAS_FILE else None
+    if bias is not None and asr_bias.norm(raw).strip() + " " in bias.cmds:
+        return ""  # a whole command as it is ("Louder.", "Next."): nothing of it went into a wake word
     words = raw.split()
     alts = toks[0][2] if toks else {}
     best, best_s = "", 0.0
@@ -708,6 +847,10 @@ def wake_guess(raw: str, toks) -> str:
         n = len(ph.split())
         s = max(difflib.SequenceMatcher(None, _sounds(" ".join(words[:k])), _sounds(ph)).ratio()
                 for k in (n, n + 1))
+        if s < 0.4:
+            # On short, quiet requests the first token's alternatives are flat: some wake word's start was
+            # always among them above -10, and that alone made "Next." a mangled "Okay Nabu" (issue #1).
+            continue
         p = asr_bias.norm(ph).strip()
         if any(len(asr_bias.norm(a).strip()) >= 3 and p.startswith(asr_bias.norm(a).strip()) and lp > -10
                for a, lp in alts.items()):
@@ -749,13 +892,19 @@ def name_check(raw: str, toks, head: str, wav: bytes, prompt: str, heard_lp: flo
     names = lists[kind]
     firsts = {asr_bias.norm(a).strip(): lp for a, lp in toks[slot_i][2].items()}
     # Words between command and name ("play some X", "turn off the X") stay as heard.
+    # A name may start with those words itself ("The Fate of Ophelia" heard as "the Fate of a Feeling"):
+    # such a name takes their place instead of following them ("play the The Fate of Ophelia" scored so badly
+    # that the right name never won; issue #1). So every candidate is scored from sp, the words before the
+    # filler, with a tail of its own.
     nr = asr_bias.norm(rest)
+    sp, filler, filler_raw = prefix, "", ""
     for f in sorted(bias.kind_fillers.get(kind, []) + bias.fillers, key=len, reverse=True):
         if nr.startswith(f) and nr[len(f):].strip() and nr.strip() not in names:
             n = len(f.split())
             words = rest.split(" ")
             lead = [w for w in words if w]
             cut = rest.find(lead[n - 1]) + len(lead[n - 1])
+            filler, filler_raw = f, rest[:cut]
             prefix, rest = prefix + rest[:cut], rest[cut:].lstrip()
             firsts = {}
             break
@@ -774,10 +923,17 @@ def name_check(raw: str, toks, head: str, wav: bytes, prompt: str, heard_lp: flo
     if any(f" {n} " in f" {heard} " for n in names):
         return raw  # a known name with more around it ("living room lights"): HA's own sentences
     whole = "".join(t for t, _, _ in toks)
-    hs = _sounds(heard)
+    hs, hs_whole = _sounds(heard), _sounds(filler + heard)
     t_pick = time.monotonic()
     sounds = _sounds_of(kind, names)
-    like = {n: difflib.SequenceMatcher(None, hs, sounds[n]).ratio() for n in names}
+    # names that start with the filler: by how the filler and what followed sound together
+    like = {n: difflib.SequenceMatcher(None, hs_whole if filler and n.startswith(filler) else hs, sounds[n]).ratio()
+            for n in names}
+
+    def tail(c):
+        """What candidate c makes of the transcript after sp."""
+        lead = "" if filler and c.startswith(filler) else filler_raw
+        return lead + " " + names[c] + ending
 
     def pick(n):
         s1 = max([lp for a, lp in firsts.items() if a and n.startswith(a)], default=-15.0)
@@ -808,23 +964,23 @@ def name_check(raw: str, toks, head: str, wav: bytes, prompt: str, heard_lp: flo
         cands = [c for c in cands if c not in pruned]
         if not cands:
             return raw
-    texts = [whole] + [prefix + " " + names[c] + ending for c in cands]
+    texts = [whole] + [sp + tail(c) for c in cands]
     # what was heard is scored by its own decode (raw logprobs, before the plugin's push)
     t_score = time.monotonic()
     if ENGINE:
         # All at once: the engine copies the encoded audio to a sequence per candidate and scores them
         # in one batched pass (~70 ms on a desktop CPU for 6, where llama-server took ~0.7 s).
-        heard_tail = whole[len(prefix):] if whole.startswith(prefix) else " " + rest + ending
-        _, _, given = (head + prefix).partition("<asr_text>")
-        scores = _engine_score(wav, prompt, given, [heard_tail] + [" " + names[c] + ending for c in cands])
+        heard_tail = whole[len(sp):] if whole.startswith(sp) else filler_raw + " " + rest + ending
+        _, _, given = (head + sp).partition("<asr_text>")
+        scores = _engine_score(wav, prompt, given, [heard_tail] + [tail(c) for c in cands])
         if pruned:
             pruned_best = max(b[c] for c in pruned)
     elif LLAMA:
         # One slot, one at a time, and only from the name on: the words before it are the same for all,
         # so they go into the (cached) prompt and each candidate costs just its own few tokens (forcing
         # the whole sentence each time took ~1 s a check on a CPU). What was heard is scored the same way.
-        heard_tail = whole[len(prefix):] if whole.startswith(prefix) else " " + rest + ending
-        hyp_s = _lc_force(wav, prompt, head + prefix, heard_tail)
+        heard_tail = whole[len(sp):] if whole.startswith(sp) else filler_raw + " " + rest + ending
+        hyp_s = _lc_force(wav, prompt, head + sp, heard_tail)
         # Branch and bound: a name scores at most what its first token did in the decode (b), so the most
         # promising go first, and the check stops once no name left could win or come within SLOT_MARGIN
         # of the best: usually 1-2 of the candidates are scored. (In parallel slots llama.cpp's server
@@ -837,7 +993,7 @@ def name_check(raw: str, toks, head: str, wav: bytes, prompt: str, heard_lp: flo
                 if b[c] < best_s - SLOT_MARGIN or (b[c] < hyp_s - SLOT_PRIOR and best_s < hyp_s - SLOT_PRIOR):
                     skipped = [x for x in order if x not in got]
                     break
-            got[c] = _lc_force(wav, prompt, head + prefix, " " + names[c] + ending)
+            got[c] = _lc_force(wav, prompt, head + sp, tail(c))
         scores = [hyp_s] + [got.get(c, float("-inf")) for c in cands]
         bounds_left = [b[c] for c in pruned + skipped] if firsts else []
         if bounds_left:  # the bounds are of the name's first token alone: right in this space as they are
@@ -915,13 +1071,32 @@ class Handler(AsyncEventHandler):
             vad = self.vad or StreamVad()
             self.vad = None
             await asyncio.to_thread(vad.feed, pcm)  # what is left (all of it if streamed faster than real time)
-            span, speech_ms = vad.span(len(pcm))
+            span, speech_ms = await asyncio.to_thread(vad.span, len(pcm), pcm)
             t_vad = time.monotonic()
             t_dec = t_chk = t_vad
             raw = text = ""
             if span is None:
                 log.info("%.1f s audio, %d ms speech: no speech, empty transcript",
                          len(pcm) / 32000, speech_ms)
+            elif vad.short:
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as w:
+                    w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+                    w.writeframes(pcm[span[0]:span[1]])
+                try:  # no context: on next to no audio that is what the model would read back
+                    heard, _, _ = await asyncio.to_thread(transcribe, buf.getvalue(), self.language, "", None)  # nor a push
+                    lp = transcribe.logprob
+                except Exception as e:
+                    log.error("transcription failed: %s", e)
+                    heard, lp = "", -1e9
+                words = asr_bias.norm(strip_wake(heard)).split()
+                # under the gate a whole command only; just over it also a few words the model is sure of
+                # ("On.", "Off."), but not what it says to near silence
+                ok = lp >= SHORT_LP and (is_command(heard) or (
+                    speech_ms >= MIN_SPEECH_MS and 0 < len(words) <= 3 and " ".join(words) not in FILLER_WORDS))
+                raw = text = strip_wake(heard) if ok else ""
+                log.info("%.1f s audio, %d ms speech, %d ms weak: %r %.1f: %s", len(pcm) / 32000, speech_ms,
+                         len(vad.weak) * 32, heard, lp, "a command, kept" if ok else "not a command, empty transcript")
             else:
                 buf = io.BytesIO()
                 with wave.open(buf, "wb") as w:
@@ -948,6 +1123,8 @@ class Handler(AsyncEventHandler):
                     except Exception as e:
                         log.error("transcription failed: %s", e)
                         raw, toks = "", []
+                if raw:
+                    _wake_seen.append(bool(WAKE_RE.match(raw)))
                 guess = wake_guess(raw, toks)
                 if guess:
                     try:
@@ -955,8 +1132,17 @@ class Handler(AsyncEventHandler):
                                                     guess + ",")
                         w_lp = transcribe.logprob
                         keep = w_lp >= heard_lp - WAKE_PRIOR
-                        log.info("wake word forced (%s): %r %.1f -> %r %.1f: %s", guess, raw, heard_lp,
-                                 w[0], w_lp, "kept" if keep else "not supported by the audio")
+                        # A forced "Alexa," is how the context starts its vocabulary ("Alexa, Home
+                        # Assistant, Drop In, ..."), and on quiet audio the model went on reading it from
+                        # there (issue #1: "Next track" came out as config/vocab.txt).
+                        echo = echoes_context(w[0], ctx)
+                        # and it must still sound like what was heard: "Lex allowed her" is "Alexa, louder";
+                        # "Louder." is not "Alexa, set a timer." (a context entry the forced "Alexa," led to)
+                        like = difflib.SequenceMatcher(None, _sounds(raw), _sounds(guess + " " + w[0])).ratio()
+                        keep = keep and not echo and like >= 0.5
+                        log.info("wake word forced (%s): %r %.1f -> %r %.1f, like %.2f: %s", guess, raw, heard_lp,
+                                 w[0], w_lp, like, "kept" if keep else "context read back" if echo
+                                 else "not what was heard" if like < 0.5 else "not supported by the audio")
                         if keep:
                             raw, toks, head = w
                             raw = raw[:1].upper() + raw[1:]
@@ -1065,5 +1251,23 @@ async def main():
     await AsyncServer.from_uri(f"tcp://0.0.0.0:{PORT}").run(Handler)
 
 
+def health() -> int:
+    """For Docker's healthcheck: this server's port open and its model server answering. The port alone
+    said "healthy" for hours while llama-server was gone (an NVIDIA driver update) and every request came
+    back empty."""
+    import socket
+    try:
+        socket.create_connection(("127.0.0.1", PORT), 2).close()
+        with urllib.request.urlopen((LLAMA_URL if LLAMA else VLLM_URL) + "/health", timeout=5):
+            pass
+        return 0
+    except Exception as e:
+        print(f"unhealthy: {e}")
+        return 1
+
+
 if __name__ == "__main__":
+    import sys
+    if sys.argv[1:] == ["--health"]:
+        sys.exit(health())
     asyncio.run(main())

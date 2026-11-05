@@ -180,6 +180,22 @@ measured against the version before it on the same clips:
 | corpus | 96.1 | **98.7** | (no names in it) |
 | corpus, noise | 96.1 | **98.4** | (no names in it) |
 
+**Quiet and clipped requests** ([issue #1](https://github.com/Nt-f/assist-asr/issues/1): an Echo Dot 2's
+requests without the wake word, where assist-asr did worse than plain Qwen3-ASR). Silero misses quiet speech,
+so a quiet request is looked at again at a normal level and goes to the model whole. Requests with very little
+speech take a short path that keeps only what the model is sure of. The wake word forcing stops while no wake
+words come. Light version, 1.7B Q8_0 on a CPU, against plain llama-server with the same model:
+
+| exactly right (%) | plain llama-server | assist-asr |
+|---|---:|---:|
+| one word ("Stop", "Next", …), peak −40 dBFS (18) | 61.1 | **77.8** |
+| one word, peak −30 dBFS (18) | 83.3 | 83.3 |
+| commands without a wake word, first 120 ms cut off (56) | 62.5 | **76.8** |
+| the same, −30 dB (56) | 60.7 | **66.1** |
+| noise only, nothing said (30) | 0 | **100** |
+| rec (22) / the same −25 dB | 72.7 / 81.8 | **90.9 / 100** |
+| corpus (307) / the same −30 dB | 93.8 / 91.9 | **99.0 / 99.0** |
+
 On the named requests that Home Assistant's own sentences understand (24 of the names set), Home Assistant
 now understands 88% as said, up from 75%: names are written exactly as your devices are spelled. The
 median time stayed where it was (95–120 ms).
@@ -329,7 +345,11 @@ All of these go in `.env`. Restart with `docker compose up -d` after a change.
 | `CONTEXT` | `1` | Also gives the model your names and `config/vocab.txt` as a prompt. |
 | `W_CMD`, `W_SLOT` | `3.0`, `2.5` | Push strength towards commands and names. Higher fixes more, but risks hearing a name that wasn't said. |
 | `SLOT_PRIOR`, `SLOT_MARGIN` | `8`, `3` | Name check: how far below what was heard a name may score and still win, and how far it must beat the next name. |
-| `WAKE_FORCE` | `auto` | When a transcript starts with what sounds like a mangled wake word ("Lex allowed her"), decode again with the wake phrase forced and keep that if the audio supports it. `off` turns it off. |
+| `WAKE_FORCE` | `auto` | When a transcript starts with what sounds like a mangled wake word ("Lex allowed her"), decode again with the wake phrase forced and keep that if the audio supports it. `auto` stops doing it while the requests come without a wake word (fewer than 1 in 4 of the last 20 start with one). `off` turns it off. |
+| `VAD_THRESHOLD`, `MIN_SPEECH_MS` | `0.3`, `150` | The speech gate: with less speech than this the transcript is empty (Qwen3-ASR otherwise answers silence with "Okay." or reads its context back), unless the short path below keeps it. |
+| `VAD_BOOST` | `30` | A quiet request with little speech found is looked at again, raised by up to this many dB (for the gate only; the model gets the audio as it was, the whole of it). Silero misses quiet speech: an Echo Dot 2's short "Stop" or "Next" came back empty. `0` turns it off. |
+| `SURE_MS`, `SHORT_MS`, `SHORT_THRESHOLD`, `SHORT_LP` | `300`, `96`, `0.1`, `-2` | The short path, for requests with less than `SURE_MS` of speech: decoded whole, without context or push, and kept only when the model is sure of it (`SHORT_LP` nats): under the gate (down to `SHORT_MS` at `SHORT_THRESHOLD`) a whole command of `commands.txt`, above it up to three words. Keeps a clipped "Stop", drops what noise makes up. `SHORT_MS=0` turns off the part under the gate. |
+| `LLAMA_WAIT` | `20` | Light version: seconds a request waits for llama-server while it restarts. |
 | `ALTERNATIVES` | (off) | Experimental: an HA sensor (e.g. `sensor.asr_alternatives`) that gets what the request might also have been, for an LLM agent. See below. |
 | `WAKE_WORDS` | `alexa\|…\|nabu` | Wake words dropped from the start of a transcript ("hey"/"ok" in front of one too: Hey Jarvis, Okay Nabu). |
 | `ZEROCONF` | (off; `assist-asr` on Proxmox) | Announces the server by mDNS under this name, so Home Assistant discovers it. Only where the server is on the LAN itself (the Proxmox CT); not from Docker's default network. |
