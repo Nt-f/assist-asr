@@ -37,27 +37,39 @@ with wave.open("/tmp/gpu-check.wav", "wb") as w:
                                                  + random.gauss(0, 800))) for i in range(48000)))
 PY
 
-ask() {  # one request: tokens, how many without a probability (NaN), the text, the time
+ask() {  # as the server asks: a context prompt of ~1500 characters of names (~450 tokens), 20 alternatives
+         # per token, prompt cache, slot 0; twice, the second from the cache. Per request: tokens, how many
+         # without a probability (NaN), the time, the text.
 python3 - <<'PY'
-import base64, json, time, urllib.request
+import base64, json, re, time, urllib.request
 u = "http://127.0.0.1:8181"
 wav = open("/tmp/gpu-check.wav", "rb").read()
+words = [l.strip() for f in ("/etc/assist-asr/vocab.txt", "/etc/assist-asr/commands.txt")
+         for l in open(f) if l.strip() and not l.startswith("#")]
+ctx = ""
+while len(ctx) < 1500:
+    ctx += ", ".join(re.sub(r"\s*>.*", "", w) for w in words) + ", "
 mk = json.load(urllib.request.urlopen(u + "/props"))["media_marker"]
-p = f"<|im_start|>user\n{mk}<|im_end|>\n<|im_start|>assistant\nlanguage English<asr_text>"
+p = (f"<|im_start|>system\n{ctx[:1500]}<|im_end|>\n<|im_start|>user\n{mk}<|im_end|>\n"
+     "<|im_start|>assistant\nlanguage English<asr_text>")
 body = {"prompt": {"prompt_string": p, "multimodal_data": [base64.b64encode(wav).decode()]},
-        "temperature": 0, "n_predict": 60, "n_probs": 5}
-t = time.time()
-r = json.load(urllib.request.urlopen(urllib.request.Request(u + "/completion", json.dumps(body).encode(),
-                                                            {"Content-Type": "application/json"}), timeout=300))
-cp = r.get("completion_probabilities") or []
-nan = sum(e.get("logprob") is None for e in cp)
-print(f"{'OK  ' if not nan and len(cp) < 60 else 'BAD '} {len(cp):3d} tokens, {nan:3d} NaN, {time.time() - t:5.2f} s: {r.get('content', '')[:50]!r}")
+        "temperature": 0, "n_predict": 60, "n_probs": 20, "cache_prompt": True, "id_slot": 0}
+out, bad = [], False
+for _ in range(2):
+    t = time.time()
+    r = json.load(urllib.request.urlopen(urllib.request.Request(u + "/completion", json.dumps(body).encode(),
+                                                                {"Content-Type": "application/json"}), timeout=300))
+    cp = r.get("completion_probabilities") or []
+    nan = sum(e.get("logprob") is None for e in cp)
+    bad |= bool(nan)  # (a tone with names as context: the model may recite them; only NaN is a fault)
+    out.append(f"{len(cp):2d} tok {nan:2d} NaN {time.time() - t:4.2f} s")
+print(("BAD " if bad else "OK  ") + " | ".join(out) + f": {r.get('content', '')[:30]!r}")
 PY
 }
 
 try() {  # name, environment, llama-server options
-  printf '%-34s' "$1"
-  env $2 /app/llama-server -hf "$M" -c 4096 -np 1 --host 127.0.0.1 --port 8181 $3 >/tmp/gpu-check.log 2>&1 &
+  printf '%-30s' "$1"
+  env $2 /app/llama-server -hf "$M" -c 8192 -np 2 --host 127.0.0.1 --port 8181 $3 >/tmp/gpu-check.log 2>&1 &
   pid=$!
   for _ in $(seq 120); do
     curl -sf http://127.0.0.1:8181/health >/dev/null 2>&1 && break
@@ -69,19 +81,23 @@ try() {  # name, environment, llama-server options
   kill $pid 2>/dev/null; wait $pid 2>/dev/null; pid=""
 }
 ALL="GGML_VK_DISABLE_COOPMAT=1 GGML_VK_DISABLE_COOPMAT2=1 GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1 GGML_VK_DISABLE_F16=1 GGML_VK_DISABLE_BFLOAT16=1 GGML_VK_DISABLE_MMVQ=1 GGML_VK_DISABLE_DOT2=1 GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1"
+F=GGML_VK_DISABLE_FUSION=1
 try "cpu (reference)"              ""                                        "-ngl 0 -dev none --no-mmproj-offload"
 try "gpu"                          ""                                        "-ngl 99"
 try "gpu, all fast paths off"      "$ALL"                                    "-ngl 99 -fa off"
+try "gpu, no fusion"               "$F"                                      "-ngl 99"
 try "gpu, flash attention off"     ""                                        "-ngl 99 -fa off"
+try "gpu, no fusion, fa off"       "$F"                                      "-ngl 99 -fa off"
 try "gpu, KV cache f32"            ""                                        "-ngl 99 -ctk f32 -ctv f32"
-try "gpu, no coopmat"              "GGML_VK_DISABLE_COOPMAT=1 GGML_VK_DISABLE_COOPMAT2=1" "-ngl 99"
 try "gpu, no integer dot product"  "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1"   "-ngl 99"
 try "gpu, no f16"                  "GGML_VK_DISABLE_F16=1"                   "-ngl 99"
 try "gpu, no bfloat16"             "GGML_VK_DISABLE_BFLOAT16=1"              "-ngl 99"
 try "gpu, no mmvq"                 "GGML_VK_DISABLE_MMVQ=1"                  "-ngl 99"
 try "gpu, no dot2"                 "GGML_VK_DISABLE_DOT2=1"                  "-ngl 99"
-try "gpu, no fusion"               "GGML_VK_DISABLE_FUSION=1"                "-ngl 99"
-try "gpu, no graph optimize"       "GGML_VK_DISABLE_GRAPH_OPTIMIZE=1"        "-ngl 99"
+try "gpu, small batches (-ub 32)"  ""                                        "-ngl 99 -ub 32"
+try "gpu, host memory"             "GGML_VK_PREFER_HOST_MEMORY=1"            "-ngl 99"
+try "gpu, serialized submissions"  "GGML_VK_SERIALIZE_SUBMISSIONS=1"         "-ngl 99"
+try "gpu, encoder on the cpu"      ""                                        "-ngl 99 --no-mmproj-offload"
 rm -f /tmp/gpu-check.wav /tmp/gpu-check.log
 IN_CT
 echo "== done; the services are running again"
