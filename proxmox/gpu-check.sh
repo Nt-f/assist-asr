@@ -5,10 +5,14 @@
 #
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nt-f/assist-asr/main/proxmox/gpu-check.sh)" -- 113
 #
+# Whether a setting breaks can change from one start of llama.cpp to the next; "soak" after the id starts the
+# candidates many times each and counts:  ... -- 113 soak
+#
 # The CT needs the GPU (pct set <id> --dev0 /dev/dri/renderD128,gid=993). Its services stop meanwhile
 # (a few minutes) and start again after.
 set -euo pipefail
-ID=${1:?usage: gpu-check.sh <CT id>}
+ID=${1:?usage: gpu-check.sh <CT id> [soak]}
+MODE=${2:-}
 command -v pct >/dev/null || { echo "run this on the Proxmox VE host"; exit 1; }
 echo "== host GPU"
 lspci -nn | grep -iE 'vga|display|3d controller' || true
@@ -16,7 +20,7 @@ grep -m1 'model name' /proc/cpuinfo || true
 pct config "$ID" | grep -E '^(dev[0-9]|cores|memory):' || true
 pct exec "$ID" -- test -e /dev/dri/renderD128 || { echo "CT $ID has no GPU: pct set $ID --dev0 /dev/dri/renderD128,gid=993 && pct reboot $ID"; exit 1; }
 
-pct exec "$ID" -- bash -s <<'IN_CT'
+{ echo "MODE=$MODE"; cat; } <<'IN_CT' | pct exec "$ID" -- bash -s
 set -u
 M=$(sed -n 's/^LIGHT_MODEL=//p' /etc/assist-asr/assist-asr.env)
 export HOME=/var/lib/assist-asr LD_LIBRARY_PATH=/app
@@ -67,8 +71,8 @@ print(("BAD " if bad else "OK  ") + " | ".join(out) + f": {r.get('content', '')[
 PY
 }
 
-try() {  # name, environment, llama-server options
-  printf '%-30s' "$1"
+try() {  # name, environment, llama-server options; prints OK/BAD with the numbers
+  printf '%-38s' "$1"
   env $2 /app/llama-server -hf "$M" -c 8192 -np 2 --host 127.0.0.1 --port 8181 $3 >/tmp/gpu-check.log 2>&1 &
   pid=$!
   for _ in $(seq 120); do
@@ -81,6 +85,21 @@ try() {  # name, environment, llama-server options
   kill $pid 2>/dev/null; wait $pid 2>/dev/null; pid=""
 }
 ALL="GGML_VK_DISABLE_COOPMAT=1 GGML_VK_DISABLE_COOPMAT2=1 GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1 GGML_VK_DISABLE_F16=1 GGML_VK_DISABLE_BFLOAT16=1 GGML_VK_DISABLE_MMVQ=1 GGML_VK_DISABLE_DOT2=1 GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1"
+if [ "$MODE" = soak ]; then  # each candidate N starts; the tally at the end
+  I=GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1
+  soak() {
+    local n=$1 name=$2 ok=0; shift 2
+    for i in $(seq "$n"); do try "$name ($i/$n)" "$@" | tee /tmp/gpu-check.line; grep -q ' OK ' /tmp/gpu-check.line && ok=$((ok + 1)); done
+    tally+=("$(printf '%-36s %2d of %2d starts OK' "$name" "$ok" "$n")")
+  }
+  tally=()
+  soak 6  "gpu"                         ""          "-ngl 99"
+  soak 12 "gpu, no integer dot product" "$I"        "-ngl 99"
+  soak 4  "gpu, all fast paths off"     "$ALL"      "-ngl 99 -fa off"
+  echo "== tally"; printf '%s\n' "${tally[@]}"
+  rm -f /tmp/gpu-check.wav /tmp/gpu-check.log /tmp/gpu-check.line
+  exit 0
+fi
 F=GGML_VK_DISABLE_FUSION=1
 try "cpu (reference)"              ""                                        "-ngl 0 -dev none --no-mmproj-offload"
 try "gpu"                          ""                                        "-ngl 99"
