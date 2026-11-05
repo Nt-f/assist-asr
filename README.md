@@ -74,9 +74,32 @@ bf16 weights.
 The old setup (`wyoming-whisper`, Qwen3-ASR 0.6B ONNX int4, CPU only) took 303 ms on 12 cores and
 1229 ms on 2.
 
-Since these were measured, the name check got faster and more accurate (scored in one pass, about 40 ms
-on vLLM) and a mangled wake word is forced: on vLLM, names now come out 83–85% exactly right (from 77–78%),
-everyday commands 98–99% (from 96%), your noisy recordings 91% (from 82–86%).
+The tables above were measured first. Two changes since then, on the full version (vLLM, 1.7B), each
+measured against the version before it on the same clips:
+
+- **Wake word forcing.** When a transcript starts with what sounds like a mangled wake word ("Lex allowed
+  her, …"), it's decoded again with the wake phrase forced, and that's kept if the audio supports it. 17
+  clips fixed, none made worse.
+- **The name check in one pass.** Each candidate name is scored in a single forward pass, all in parallel,
+  with only the compared names as context: about 40 ms a check instead of about 160 ms. It's also more
+  accurate, since the whole name is scored at once.
+
+| exactly right (%) | before | + wake word forcing | + one-pass name check |
+|---|---:|---:|---:|
+| names | 77.7 | 78.5 | **83.1** |
+| names, noise | 76.9 | 76.9 | **84.6** |
+| rec | 95.5 | 95.5 | 95.5 |
+| rec, noise | 86.4 | **90.9** | **90.9** |
+| corpus | 96.1 | **98.7** | (no names in it) |
+| corpus, noise | 96.1 | **98.4** | (no names in it) |
+
+On the named requests that Home Assistant's own sentences understand (24 of the names set), Home Assistant
+now understands 88% as said, up from 75%: names are written exactly as your devices are spelled. The
+median time stayed where it was (95–120 ms).
+
+On the light version, the name check is the part llama-server makes slow: it can't score a given text, so
+each candidate is generated under a grammar, one after another. `engine/` (below) does it in one batched pass
+on llama.cpp's library instead.
 
 Exactly right on the same 62 requests: 1.7B 81–84% ours against 66% stock, 0.6B 73–77% against 58–65%,
 on every runtime. The Q8 models of the light version are as accurate as vLLM's bf16 here.
@@ -84,8 +107,9 @@ on every runtime. The Q8 models of the light version are as accurate as vLLM's b
 How to read these numbers:
 
 - **Ours costs little on top of the bare model:** 5–10 ms on a GPU with the light version, more on vLLM
-  (its plugin reads tokens back at each step). The name check adds about 150 ms (light on a CPU: up to
-  about 0.8 s, one candidate after another) on the roughly one in three named requests whose name isn't in the list as heard.
+  (its plugin reads tokens back at each step). The name check runs on the roughly one in three named
+  requests whose name isn't in the list as heard. It adds about 40 ms on vLLM, about 100 ms on a CPU with
+  `engine/`, and up to about 0.8 s on a CPU with llama-server (one candidate after another).
 - **On a CPU, the light 0.6B is the pick.** It's more accurate than either 1.7B without this project, and
   about a quarter of a second on a desktop CPU.
 - **A small iGPU doesn't help.** The 610M was slower than 2 CPU cores. It does take the load off the CPU.
@@ -100,7 +124,7 @@ on your own requests (below) before you trust any of this for your home.
 | Version | Runs on | Disk | 1.7B per request | 0.6B per request |
 |---|---|---:|---:|---:|
 | **Light, CUDA** (`compose.light.yml` + `compose.light.cuda.yml`) | NVIDIA GPU | 4.9 GB + model | 66 ms | 50 ms |
-| **Full** (`docker-compose.yml`, vLLM) | NVIDIA GPU, ~6 GB free | 7.8 GB + model | 112 ms | 73 ms |
+| **Full** (`docker-compose.yml`, vLLM) | NVIDIA GPU, ~6 GB free | 8.0 GB + model | 112 ms | 73 ms |
 | **Light, CPU** (`compose.light.yml`) | any x86 or ARM CPU (a Pi too) | 1.2 GB + model | 563 ms (12 cores) | 271 ms (12 cores), 654 ms (2 cores) |
 | **Light, Vulkan** (`+ compose.light.vulkan.yml`) | AMD or Intel GPU / iGPU | 1.2 GB + model | depends on the GPU | see below |
 | **Proxmox CT** (`proxmox/`) | a Proxmox host: CPU, or its iGPU shared in | 0.2 GB template + model | as Light, CPU or Vulkan | |
@@ -118,6 +142,29 @@ speeds are medians of real requests on an RTX 3090 and a Ryzen 9 7900X (the Resu
 
 Optional for all of them, but this is where the accuracy comes from: Home Assistant (your device and area
 names) and Music Assistant (your music library).
+
+### What's in the images
+
+Sizes unpacked on disk, plus 0.2 GB for the Wyoming server's own image in every version:
+
+| image | size | |
+|---|---:|---|
+| vLLM, ours (`vllm-slim/`) | **8.0 GB** | what the full version builds on first start |
+| vLLM, official (`vllm/vllm-openai:v0.31.0`, `compose.official.yml`) | 22.0 GB | the same vLLM 0.31.0 |
+| llama.cpp, CUDA (`ghcr.io/ggml-org/llama.cpp:server-cuda`) | 4.9 GB | |
+| llama.cpp, CPU or Vulkan (`:server`, `:server-vulkan`) | 1.2 GB | |
+| asr-engine (`engine/`) | 1.2 GB | llama.cpp's CPU image with the engine added |
+
+`vllm-slim/` is pip's vLLM on a slim Python image, with what a Qwen3-ASR server never loads taken out:
+- **FlashInfer's prebuilt kernels and JIT cache** (~9 GB): attention here is vLLM's own FLASH_ATTN, and
+  FlashInfer's sampler is switched off (`VLLM_USE_FLASHINFER_SAMPLER=0`).
+- **The CUDA toolkit**: nothing of it is loaded.
+- **What a running server never maps** (read from `/proc/*/maps` of one): CUDA libraries for other jobs,
+  CUDA headers, video decoding, DeepSeek's MLA kernels, test folders, profiling static libraries.
+
+It keeps torch, the CUDA runtime libraries it maps, and triton with a C compiler for its launchers (gcc
+needs its own `libgcc.a`, so only the profiling ones go). It runs the same vLLM 0.31.0 code as the official
+image; `compose.official.yml` is there to compare against it, or to fall back on after a vLLM update.
 
 ## Set up
 
@@ -158,11 +205,19 @@ In Home Assistant:
 
 `compose.engine.yml` runs the light version on `engine/`: a small server on llama.cpp's own library
 instead of llama-server. It encodes the audio once and scores all of a name check's candidates in one
-batched pass. Measured on a 12-core CPU with the 0.6B:
-- **Name check:** about 100 ms instead of about 550 ms with llama-server.
-- **Accuracy:** names 78.5% exactly right instead of 74.6%.
-- **Speed:** slowest 10% of requests 665 ms instead of 1006 ms, but the median plain request is about
-  70 ms slower (392 against 319 ms).
+batched pass. Measured on a 12-core CPU with the 0.6B, on the names set:
+
+| | llama-server (light) | asr-engine |
+|---|---:|---:|
+| name check (6 candidates) | ~550 ms | **~100 ms** |
+| names exactly right | 74.6% | **78.5%** |
+| Home Assistant understood the name as said | 83% | **92%** |
+| median request | **319 ms** | 392 ms |
+| slowest 10% of requests | 1006 ms | **665 ms** |
+
+Better accuracy and a better worst case, but a slower typical request. The rest of llama-server's speed
+comes from batching the encoded audio together with the text that follows it, which the library's public
+API doesn't offer; that's why llama-server stays the default. `engine/NOTES.md` has what was tried.
 
 ```sh
 docker compose -f compose.engine.yml up -d            # CPU; ENGINE_VARIANT=server-vulkan or server-cuda for a GPU
