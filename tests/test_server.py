@@ -137,6 +137,33 @@ def test_vad_boost_leaves_noise():
         assert span is None and ms == 0, (lvl, ms)
 
 
+def test_short_path():
+    """issue #1's second round: what the short path keeps (Silero's speech count under the gate)."""
+    k = server.short_keep
+    assert k("No, I want you to stop the timer.", -0.1, 256, False)      # a sure sentence, whatever was counted
+    assert k("Hey! Hey! Hey! Don't get annoyed.", -1.3, 0, False)
+    assert not k("Stop. Stop for me, and.", -3.3, 256, False)             # unsure
+    assert not k("Six.", -1.9, 0, False)                                  # one word under the gate, no command
+    assert k("Stop.", -0.2, 0, False) and k("Next track.", -0.5, 64, False)
+    assert not k("Thank you for watching.", -0.3, 200, False)             # what silence says
+    assert not k("The first was the first of the three major battles of the Civil War.", -31.2, 0, False)   # noise
+    assert k("Alexa, stop.", -0.4, 0, True) and not k("Alexa, stop.", -1.5, 0, True)   # a burst: a sure command only
+    assert not k("Turn it off now please.", -0.2, 0, True)
+
+
+def test_burst():
+    import array
+    r = random.Random(2)
+    zeros = [0] * 12800                                          # hassmic's lead-in
+    room = lambda n: [int(r.gauss(0, 30)) for _ in range(n)]     # about -60 dBFS
+    word = lambda ms: [int(3000 * math.sin(i / 7) + r.gauss(0, 30)) for i in range(16 * ms)]
+    pcm = lambda xs: array.array("h", xs).tobytes()
+    assert server.burst_ms(pcm(zeros + room(8000) + word(300) + room(8000))) >= 250
+    assert server.burst_ms(pcm(zeros + room(24000))) < 100                         # the room alone
+    click = room(8000) + [8000 * (1 if i % 2 else -1) for i in range(200)] + room(8000)
+    assert server.burst_ms(pcm(zeros + click)) < server.BURST_MS                   # a knock is not a command
+
+
 def test_strip_wake():
     assert server.strip_wake("Alexa, stop.") == "Stop."
     assert server.strip_wake("Alexa.") == ""

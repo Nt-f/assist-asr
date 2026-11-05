@@ -90,6 +90,12 @@ SHORT_MS = int(os.environ.get("SHORT_MS", "96"))
 SHORT_THRESHOLD = float(os.environ.get("SHORT_THRESHOLD", "0.1"))
 SURE_MS = int(os.environ.get("SURE_MS", "300"))  # less speech than this goes the short path's way too
 SHORT_LP = float(os.environ.get("SHORT_LP", "-2"))
+# Under SURE_MS too: a sentence of 3+ words this sure (nats, the whole decode) whatever Silero counted ("No, I want you
+# to stop the timer." at -0.1 with 256 ms found in 1.7 s of speech, issue #1); silence's own phrases aside.
+LONG_LP = float(os.environ.get("LONG_LP", "-1.5"))
+# No speech found at all but a clear sound (BURST_MS of it over the room): a whole command at BURST_LP or better.
+BURST_MS = int(os.environ.get("BURST_MS", "150"))
+BURST_LP = float(os.environ.get("BURST_LP", "-1"))
 VAD_BOOST = float(os.environ.get("VAD_BOOST", "30"))  # dB at most a quiet request is raised by for the VAD; 0: off
 RECORD_DIR = os.environ.get("RECORD_DIR", "")
 USE_CONTEXT = os.environ.get("CONTEXT", "1") != "0"
@@ -137,6 +143,22 @@ def strip_wake(text: str) -> str:
     return out
 
 
+def burst_ms(pcm) -> int:
+    """How long the request is clearly louder than its own room: 10 ms frames 15 dB or more over the quietest
+    tenth of them (hassmic's lead-in of digital zeros left out) and over -50 dBFS."""
+    a = array.array("h", bytes(pcm[:len(pcm) // 2 * 2]))
+    dbs = []
+    for i in range(0, len(a) - 159, 160):
+        f = a[i:i + 160]
+        p = sum(x * x for x in f) / 160
+        if p > 0:
+            dbs.append(10 * math.log10(p / (32768 * 32768)))
+    if len(dbs) < 10:
+        return 0
+    floor = sorted(dbs)[len(dbs) // 10]
+    return 10 * sum(1 for d in dbs if d >= max(floor + 15, -50))
+
+
 class StreamVad:
     """Silero VAD fed while the audio streams in, so the speech is found by the time it ends
     (all at once at the end: ~150 sequential 32 ms windows for 5 s, all on the waiting time)."""
@@ -148,6 +170,7 @@ class StreamVad:
         self.hits = []
         self.weak = []  # windows at SHORT_THRESHOLD or more
         self.quiet = False  # span(): its speech found only boosted
+        self.burst = False  # span(): no speech found, only a sound clearly over the room's floor
         self.short = False  # span(): under the gate, but enough for a short command (SHORT_MS)
 
     def feed(self, pcm) -> None:
@@ -181,6 +204,11 @@ class StreamVad:
             # "Stop". Decoded anyway, and the handler keeps only a whole command the model is sure of.
             if SHORT_MS and len(self.weak) * 32 >= SHORT_MS:
                 self.short = True
+                return (0, total), ms
+            if BURST_MS and pcm is not None and burst_ms(pcm) >= BURST_MS:
+                # Silero found nothing at all where there was a clear sound (an Echo Dot 2's "Stop", "Next",
+                # "Alexa, stop" at 0 ms, issue #1): decoded, and only a whole command the model is very sure of is kept
+                self.short = self.burst = True
                 return (0, total), ms
             return None, ms
         if self.quiet:
@@ -814,8 +842,21 @@ _wake_seen = collections.deque(maxlen=20)
 
 
 # What Qwen3-ASR says to next to nothing: never a request on its own
+# What Qwen3-ASR (like Whisper) says to silence and noise: never kept from the short path
+SILENCE_SAYS = {"thank you for watching", "thanks for watching", "thank you very much", "please subscribe",
+                "thank you so much", "see you next time", "thank you for listening", "bye bye"}
 FILLER_WORDS = {"a", "ah", "uh", "um", "hmm", "mm", "oh", "okay", "ok", "yeah", "yes", "no", "you", "thank you",
                 "thanks", "bye", "so", "the", "i", "and", "huh", "hm"}
+
+
+def short_keep(heard: str, lp: float, speech_ms: int, burst: bool) -> bool:
+    """The short path's verdict on its decode (no context, no push): keep it, or an empty transcript."""
+    words = asr_bias.norm(strip_wake(heard)).split()
+    if burst:   # no speech found at all: a whole command, very sure
+        return is_command(heard) and lp >= BURST_LP
+    if lp < SHORT_LP or not words or " ".join(words) in SILENCE_SAYS or all(w in FILLER_WORDS for w in words):
+        return False
+    return is_command(heard) or (len(words) >= 3 and lp >= LONG_LP) or (speech_ms >= MIN_SPEECH_MS and len(words) <= 3)
 
 
 def is_command(text: str) -> bool:
@@ -1097,8 +1138,7 @@ class Handler(AsyncEventHandler):
                 words = asr_bias.norm(strip_wake(heard)).split()
                 # under the gate a whole command only; just over it also a few words the model is sure of
                 # ("On.", "Off."), but not what it says to near silence
-                ok = lp >= SHORT_LP and (is_command(heard) or (
-                    speech_ms >= MIN_SPEECH_MS and 0 < len(words) <= 3 and " ".join(words) not in FILLER_WORDS))
+                ok = short_keep(heard, lp, speech_ms, vad.burst)
                 raw = text = strip_wake(heard) if ok else ""
                 log.info("%.1f s audio, %d ms speech, %d ms weak: %r %.1f: %s", len(pcm) / 32000, speech_ms,
                          len(vad.weak) * 32, heard, lp, "a command, kept" if ok else "not a command, empty transcript")
