@@ -180,7 +180,13 @@ for i in $(seq 1 180); do
   sleep 5
 done
 curl -sf "http://127.0.0.1:$LLAMA_PORT/health" >/dev/null 2>&1 || die "llama-server isn't up: $LOGS/llama.log"
-grep -qi "metal" "$LOGS/llama.log" && say "llama.cpp runs on Metal" || say "no Metal in llama.cpp's log: it runs on the CPU"
+# what llama.cpp finds (Metal shows as MTL0, e.g. "MTL0: Apple M2 Max"): asked, not guessed from the log
+DEVICES=$("$LLAMA_SERVER" --list-devices 2>&1 | grep -E "^\s*[A-Za-z]+[0-9]+:" || true)
+if printf '%s' "$DEVICES" | grep -q "MTL"; then
+  say "llama.cpp runs on Metal: $(printf '%s' "$DEVICES" | grep MTL | head -1 | sed 's/^ *//')"
+else
+  say "llama.cpp found no Metal device here: it runs on the CPU (${DEVICES:-no devices listed})"
+fi
 for i in $(seq 1 60); do
   "$APP/venv/bin/python" -c "import socket; socket.create_connection(('127.0.0.1', $PORT), 2)" 2>/dev/null && break
   sleep 2

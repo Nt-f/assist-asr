@@ -51,7 +51,8 @@ jobs:
         if: always()
         run: |
           L="$HOME/Library/Logs/assist-asr"
-          { echo "### llama.cpp on this runner"; echo '```'; grep -iE "metal|ggml_.*backend|using device|offload" "$L/llama.log" | head -20; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### llama.cpp on this runner"; echo '```'; llama-server --list-devices 2>&1 | tail -8
+            grep -iE "metal|MTL|using device|offloaded|tokens per second" "$L/llama.log" | head -12; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           tail -40 "$L/llama.log"; tail -20 "$L/wyoming.log"
 
       - name: Uninstall
