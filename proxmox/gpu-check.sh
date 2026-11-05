@@ -7,11 +7,12 @@
 #
 # Whether a setting breaks can change from one start of llama.cpp to the next; "soak" after the id starts the
 # candidates many times each and counts:  ... -- 113 soak
+# "builds" does that for older llama.cpp releases (default settings), to see whether a newer one broke it.
 #
 # The CT needs the GPU (pct set <id> --dev0 /dev/dri/renderD128,gid=993). Its services stop meanwhile
 # (a few minutes) and start again after.
 set -euo pipefail
-ID=${1:?usage: gpu-check.sh <CT id> [soak]}
+ID=${1:?usage: gpu-check.sh <CT id> [soak|builds]}
 MODE=${2:-}
 command -v pct >/dev/null || { echo "run this on the Proxmox VE host"; exit 1; }
 echo "== host GPU"
@@ -71,9 +72,10 @@ print(("BAD " if bad else "OK  ") + " | ".join(out) + f": {r.get('content', '')[
 PY
 }
 
+BIN=/app
 try() {  # name, environment, llama-server options; prints OK/BAD with the numbers
   printf '%-38s' "$1"
-  env $2 /app/llama-server -hf "$M" -c 8192 -np 2 --host 127.0.0.1 --port 8181 $3 >/tmp/gpu-check.log 2>&1 &
+  env LD_LIBRARY_PATH=$BIN $2 $BIN/llama-server -hf "$M" -c 8192 -np 2 --host 127.0.0.1 --port 8181 $3 >/tmp/gpu-check.log 2>&1 &
   pid=$!
   for _ in $(seq 120); do
     curl -sf http://127.0.0.1:8181/health >/dev/null 2>&1 && break
@@ -85,6 +87,24 @@ try() {  # name, environment, llama-server options; prints OK/BAD with the numbe
   kill $pid 2>/dev/null; wait $pid 2>/dev/null; pid=""
 }
 ALL="GGML_VK_DISABLE_COOPMAT=1 GGML_VK_DISABLE_COOPMAT2=1 GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1 GGML_VK_DISABLE_F16=1 GGML_VK_DISABLE_BFLOAT16=1 GGML_VK_DISABLE_MMVQ=1 GGML_VK_DISABLE_DOT2=1 GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1"
+if [ "$MODE" = builds ]; then  # the CT's llama.cpp and older releases, 4 starts each, default settings
+  W=/var/tmp/gpu-check-builds; mkdir -p "$W"
+  tally=()
+  for b in image b12098 b12000 b11500 b11000 b10000; do
+    if [ "$b" = image ]; then BIN=/app; name="the CT's (image's nightly)"
+    else
+      BIN=$W/llama-$b; name=$b
+      [ -x "$BIN/llama-server" ] || curl -fsSL "https://github.com/ggml-org/llama.cpp/releases/download/$b/llama-$b-bin-ubuntu-vulkan-x64.tar.gz" | tar xz -C "$W" \
+        || { echo "$b: download failed"; continue; }
+    fi
+    ok=0
+    for i in 1 2 3 4; do try "$name ($i/4)" "" "-ngl 99" | tee /tmp/gpu-check.line; grep -q ' OK ' /tmp/gpu-check.line && ok=$((ok + 1)); done
+    tally+=("$(printf '%-36s %d of 4 starts OK' "$name" "$ok")")
+  done
+  echo "== tally"; printf '%s\n' "${tally[@]}"
+  rm -rf "$W" /tmp/gpu-check.wav /tmp/gpu-check.log /tmp/gpu-check.line
+  exit 0
+fi
 if [ "$MODE" = soak ]; then  # each candidate N starts; the tally at the end
   I=GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1
   soak() {
