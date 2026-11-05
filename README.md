@@ -2,8 +2,7 @@
 
 Speech to text for Home Assistant voice assistants that hears **commands and your own names**
 (your music library, your devices) far better than a speech model on its own. It runs Qwen3-ASR on
-your GPU with [vLLM](https://github.com/vllm-project/vllm) and serves it to Home Assistant over the
-Wyoming protocol, like `wyoming-whisper` does.
+your GPU or CPU and serves it to Home Assistant over the Wyoming protocol, like `wyoming-whisper` does.
 
 On top of the plain model it:
 
@@ -18,7 +17,91 @@ On top of the plain model it:
 - **gives an empty transcript on silence.** It doesn't invent "Okay." or "I'm not sure.", and it drops
   a leading wake word ("Alexa, pause" → "Pause"), for satellites that send the wake word along.
 
+## Install
+
+### 1. Light or full?
+
+Both run the same Qwen3-ASR model with the same tricks around it: the command push, the name check, wake word
+forcing. They differ in what runs the model.
+
+| | **Light** | **Full** |
+|---|---|---|
+| runs the model with | [llama.cpp](https://github.com/ggml-org/llama.cpp) (`llama-server`) | [vLLM](https://github.com/vllm-project/vllm) |
+| model | 8-bit (Q8 GGUF): 1.0 GB (0.6B), 2.5 GB (1.7B) | original 16-bit: 1.8 GB (0.6B), 4.4 GB (1.7B) |
+| runs on | CPU (x86 or ARM, a Pi too), NVIDIA (CUDA), AMD or Intel GPU/iGPU (Vulkan), Proxmox container | NVIDIA GPU only, ~6 GB of its memory |
+| image | 1.2 GB (CPU, Vulkan), 4.9 GB (CUDA) | 8.0 GB |
+| per request, RTX 3090, 1.7B / 0.6B | **66 / 50 ms** | 112 / 73 ms |
+| per request, 12-core CPU, 0.6B | **271 ms** | 472 ms (not meant for CPUs) |
+| name check, when one runs | one candidate after another: fast on a GPU, up to 0.8 s on a CPU | **all at once, ~40 ms** |
+| names exactly right | lower: its name check isn't the one-pass one | **highest: 83–85%** (Results) |
+
+- **No NVIDIA GPU:** light. On a CPU, the 0.6B model: about a quarter of a second on a desktop CPU.
+- **An NVIDIA GPU with ~6 GB free:** full gets your names right most often; light is faster on plain requests
+  and much smaller. Both are fine.
+- **A Proxmox host:** the Proxmox container (light, no Docker), below.
+- **A small iGPU** (a Radeon 610M, 2 compute units) was slower than 2 CPU cores; a 680M/780M or a recent Intel
+  iGPU should do better, unmeasured. Try both with the benchmark.
+
+The 0.6B model is about half the time of the 1.7B and a few points less accurate (Results).
+
+### 2. Settings
+
+```sh
+git clone https://github.com/Nt-f/assist-asr.git && cd assist-asr
+cp .env.example .env
+```
+
+In `.env`, set:
+
+- `HASS_URL`: Home Assistant's address, e.g. `http://192.168.1.10:8123`.
+- `HASS_TOKEN`: a long-lived access token. In Home Assistant, open your profile, then **Security** →
+  **Long-lived access tokens** → **Create token**.
+- The model: `LIGHT_MODEL` for light, `ggml-org/Qwen3-ASR-0.6B-GGUF:Q8_0` (default) or
+  `ggml-org/Qwen3-ASR-1.7B-GGUF:Q8_0`; `ASR_MODEL` for full, `Qwen/Qwen3-ASR-1.7B` (default) or
+  `Qwen/Qwen3-ASR-0.6B`.
+
+Home Assistant and Music Assistant are optional, but your names come from them, and that's where the accuracy
+comes from.
+
+### 3. Start it
+
+```sh
+docker compose -f compose.light.yml up -d                             # light, CPU
+docker compose -f compose.light.yml -f compose.light.cuda.yml up -d   # light, NVIDIA GPU
+docker compose -f compose.light.yml -f compose.light.vulkan.yml up -d # light, AMD/Intel GPU or iGPU
+docker compose up -d                                                  # full (vLLM, NVIDIA GPU)
+```
+
+The first start downloads the model, and the full version builds its vLLM image (`vllm-slim/`): a few minutes.
+Watch it with `docker compose logs -f` (with the same `-f` files). It's ready once the log says
+`listening on 10300`.
+
+### 4. Add it to Home Assistant
+
+1. **Settings → Devices & services → Add integration → Wyoming Protocol**.
+2. This machine's address, port `10300`.
+3. **Settings → Voice assistants**: open your assistant and pick it as **Speech-to-text**.
+
+### On Proxmox
+
+The light version as a container (CT), without Docker. In the Proxmox host's shell:
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nt-f/assist-asr/main/proxmox/install.sh)"
+```
+
+It asks for Home Assistant's address and token, the model, and whether to share the host's AMD or Intel iGPU,
+then creates the container and prints its address. Home Assistant discovers it by itself (Settings → Devices &
+services). Updates, scripted installs and GPU trouble: "Proxmox in detail" under More about the versions.
+
 ## Results
+
+Measured on an RTX 3090 and a Ryzen 9 7900X (12 cores), against the same model with nothing
+around it (stock) and against `wyoming-whisper`'s Qwen3-ASR (old). In short, on the full 1.7B:
+requests with one of your names exactly right 83–85% against 65% stock, everyday commands 98–99%; 50–112 ms
+a request on the GPU, about a quarter of a second for the light 0.6B on a desktop CPU.
+
+<details><summary><b>How it was measured</b></summary>
 
 Measured 2026-11-04 on an AMD Ryzen 9 7900X (12 cores) with an RTX 3090. The models,
 run three ways:
@@ -39,7 +122,9 @@ The datasets:
 
 With **noise**, room noise is mixed in at 5 dB below the speech.
 
-### Accuracy: requests exactly right (%)
+</details>
+
+<details><summary><b>Accuracy: requests exactly right (%)</b></summary>
 
 | dataset | 1.7B ours | 1.7B stock | 0.6B ours | 0.6B stock | old (0.6B int4) |
 |---|---:|---:|---:|---:|---:|
@@ -55,7 +140,9 @@ Names right, on the names set: 1.7B 76% ours against 65% stock, 0.6B 74% against
 that stock got right, out of 40: "play some Mozart" came out as "mochot", pulled towards the library's
 many "Mo…" names. That's the price of a push, and what `W_SLOT` trades.
 
-### Speed: median time from the end of speech to the transcript
+</details>
+
+<details><summary><b>Speed (median time from the end of speech to the transcript), and the changes since</b></summary>
 
 On 62 requests (rec, plus 40 from names). Ours is fed at speaking pace, as a satellite sends it, and
 includes the name check when one runs. Light = llama.cpp with Q8 models; full = vLLM with the original
@@ -118,32 +205,11 @@ How to read these numbers:
 Small datasets: one real speaker, and synthetic voices that sometimes mispronounce the names. Measure
 on your own requests (below) before you trust any of this for your home.
 
+</details>
 
-## Pick a version
+## More about the versions
 
-| Version | Runs on | Disk | 1.7B per request | 0.6B per request |
-|---|---|---:|---:|---:|
-| **Light, CUDA** (`compose.light.yml` + `compose.light.cuda.yml`) | NVIDIA GPU | 4.9 GB + model | 66 ms | 50 ms |
-| **Full** (`docker-compose.yml`, vLLM) | NVIDIA GPU, ~6 GB free | 8.0 GB + model | 112 ms | 73 ms |
-| **Light, CPU** (`compose.light.yml`) | any x86 or ARM CPU (a Pi too) | 1.2 GB + model | 563 ms (12 cores) | 271 ms (12 cores), 654 ms (2 cores) |
-| **Light, Vulkan** (`+ compose.light.vulkan.yml`) | AMD or Intel GPU / iGPU | 1.2 GB + model | depends on the GPU | see below |
-| **Proxmox CT** (`proxmox/`) | a Proxmox host: CPU, or its iGPU shared in | 0.2 GB template + model | as Light, CPU or Vulkan | |
-
-Models: 1.0 GB (0.6B) or 2.5 GB (1.7B) for the light versions; 1.8 GB or 4.4 GB for the full one. The
-speeds are medians of real requests on an RTX 3090 and a Ryzen 9 7900X (the Results above).
-
-- **On an NVIDIA GPU, the light CUDA version is the pick**: faster than vLLM here, the same accuracy, and
-  a smaller download. The full version is the one the accuracy tables above were measured with first;
-  it remains for vLLM's own features.
-- **Without one, the light CPU version with the 0.6B model**: about a quarter of a second on a desktop CPU.
-- **An iGPU only helps when it's a capable one.** The Radeon 610M here (2 compute units) was slower than
-  2 CPU cores: 0.6 s for the 0.6B. A Radeon 680M/780M (12 units) or a recent Intel iGPU should do far
-  better, but that's unmeasured. Try both with the benchmark below.
-
-Optional for all of them, but this is where the accuracy comes from: Home Assistant (your device and area
-names) and Music Assistant (your music library).
-
-### What's in the images
+<details><summary><b>What's in the images</b></summary>
 
 Sizes unpacked on disk, plus 0.2 GB for the Wyoming server's own image in every version:
 
@@ -166,42 +232,9 @@ It keeps torch, the CUDA runtime libraries it maps, and triton with a C compiler
 needs its own `libgcc.a`, so only the profiling ones go). It runs the same vLLM 0.31.0 code as the official
 image; `compose.official.yml` is there to compare against it, or to fall back on after a vLLM update.
 
-## Set up
+</details>
 
-```sh
-git clone https://github.com/Nt-f/assist-asr.git && cd assist-asr
-cp .env.example .env
-```
-
-Edit `.env` and set:
-
-- `HASS_URL`: Home Assistant's address, e.g. `http://192.168.1.10:8123`.
-- `HASS_TOKEN`: a long-lived access token. In Home Assistant, open your profile, then **Security** →
-  **Long-lived access tokens** → **Create token**.
-
-Then start one version:
-
-```sh
-docker compose -f compose.light.yml -f compose.light.cuda.yml up -d   # light, NVIDIA GPU
-docker compose -f compose.light.yml up -d                             # light, CPU
-docker compose -f compose.light.yml -f compose.light.vulkan.yml up -d # light, AMD/Intel GPU or iGPU
-docker compose up -d                                                  # full (vLLM, NVIDIA GPU)
-```
-
-For the light versions, `LIGHT_MODEL` in `.env` picks the model: `ggml-org/Qwen3-ASR-0.6B-GGUF:Q8_0` (the
-default) or `ggml-org/Qwen3-ASR-1.7B-GGUF:Q8_0`. For the full version it's `ASR_MODEL`. The full version
-builds its vLLM image (`vllm-slim/`) on first start, which takes a few minutes.
-
-The first start downloads the model and takes a few minutes. Watch it with `docker compose logs -f`
-(add the same `-f` files as above). It's ready once the log says `listening on 10300`.
-
-In Home Assistant:
-
-1. Go to **Settings → Devices & services → Add integration → Wyoming Protocol**.
-2. Enter this machine's address and port `10300`.
-3. Go to **Settings → Voice assistants**, open your assistant and pick it as **Speech-to-text**.
-
-### The light version on asr-engine (experimental)
+<details><summary><b>The light version on asr-engine (experimental)</b></summary>
 
 `compose.engine.yml` runs the light version on `engine/`: a small server on llama.cpp's own library
 instead of llama-server. It encodes the audio once and scores all of a name check's candidates in one
@@ -225,20 +258,16 @@ docker compose -f compose.engine.yml up -d            # CPU; ENGINE_VARIANT=serv
 
 It's built against llama.cpp build b12098 (`engine/Dockerfile`); its image and source move together.
 
-### On Proxmox
+</details>
+
+<details><summary><b>Proxmox in detail</b></summary>
 
 `proxmox/` builds a CT template and makes a container from it: the light version without Docker, with
 systemd services. If the host has an AMD or Intel iGPU, it's shared with the container (not passed
 through, so the host and other containers keep it, and there's none of the reset trouble of handing an
 AMD iGPU to a VM).
 
-In the Proxmox host's shell (nothing to install there, no Docker, no git):
-
-```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nt-f/assist-asr/main/proxmox/install.sh)"
-```
-
-It asks for Home Assistant's address and token, the model, and whether to share the GPU (or "advanced" for
+`proxmox/install.sh` (above; nothing to install on the host, no Docker, no git) asks for Home Assistant's address and token, the model, and whether to share the GPU (or "advanced" for
 the id, storage, bridge, cores, memory and disk). It then downloads the template from the latest release
 (~250 MB, checked against its SHA-256), creates the container, and prints its address. Home Assistant also discovers it by itself (mDNS): it
 shows up under Settings → Devices & services, ready to add. The container's Console in Proxmox shows the
@@ -277,6 +306,16 @@ The template is llama.cpp's own base, Ubuntu 26.04. A Proxmox that doesn't know 
 an "unmanaged" container, which configures its own network by DHCP. It was tested by booting it under
 systemd on a PC with an iGPU passed in, but not yet on a Proxmox host.
 
+</details>
+
+<details><summary><b>vLLM on a CPU</b></summary>
+
+The full version also has a CPU build of vLLM (`docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d`,
+`CPU_CORES` to limit it). The light CPU version is faster (271 ms against 472 ms for the 0.6B on 12 cores)
+and 10 GB smaller, so this is only for comparisons.
+
+</details>
+
 ## Settings
 
 All of these go in `.env`. Restart with `docker compose up -d` after a change.
@@ -310,6 +349,8 @@ A `name check` line shows the scores whenever a name was weighed against your li
 
 ## Alternatives for your LLM (experimental)
 
+<details><summary>How to use it</summary>
+
 Most requests aren't matched by Home Assistant's own sentences and go to the conversation agent, often an
 LLM. With `ALTERNATIVES=sensor.asr_alternatives`, each request also writes what it might have been to that
 sensor, before the transcript goes to HA. The alternatives are the names that came close in the name check,
@@ -328,11 +369,7 @@ Prefer the reading that names a device, area or music that exists here.{% endif 
 There is one sensor for all satellites, so two requests at the same moment can overwrite each other. It's
 off by default until this has been tried with a real LLM.
 
-## vLLM on a CPU
-
-The full version also has a CPU build of vLLM (`docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d`,
-`CPU_CORES` to limit it). The light CPU version is faster (271 ms against 472 ms for the 0.6B on 12 cores)
-and 10 GB smaller, so this is only for comparisons.
+</details>
 
 ## Benchmark
 
@@ -343,7 +380,7 @@ only this one.
 python3 -m venv .venv && .venv/bin/pip install -r bench/requirements.txt
 ```
 
-### A dataset
+<details><summary><b>A dataset</b></summary>
 
 A dataset is a folder of 16 kHz mono WAV files with a `manifest.jsonl`, one line per clip:
 
@@ -355,7 +392,9 @@ A dataset is a folder of 16 kHz mono WAV files with a `manifest.jsonl`, one line
 a manifest, you can put a `<clip>.txt` with the words said next to each `<clip>.wav`. To convert other
 audio: `ffmpeg -i in.m4a -ar 16000 -ac 1 -c:a pcm_s16le out.wav`.
 
-### Your own recordings (the best test)
+</details>
+
+<details><summary><b>Your own recordings (the best test)</b></summary>
 
 1. With `RECORD_DIR` set (the default), use your voice assistant as usual. Every request lands in
    `data/rec`.
@@ -369,7 +408,9 @@ audio: `ffmpeg -i in.m4a -ar 16000 -ac 1 -c:a pcm_s16le out.wav`.
    the clip. Add ` | <name>` after the text when the request contained one of your names, e.g.
    `Alexa, shuffle Zola | Zola`.
 
-### Synthetic names
+</details>
+
+<details><summary><b>Synthetic names</b></summary>
 
 You can generate a set of "play <your music>" and "turn off <your device>" requests in eight synthetic
 voices with [OmniVoice](https://github.com/k2-fsa/OmniVoice). It needs a GPU with about 4 GB free, so
@@ -384,7 +425,9 @@ omnivoice/bin/python bench/synth.py data/sets/names --names data/bias.json
 aren't in your lists ("play Taylor Swift"); those must come out unchanged. Any list of sentences works
 too: `bench/synth.py OUT --texts sentences.txt`.
 
-### Run, report, compare
+</details>
+
+<details><summary><b>Run, report, compare</b></summary>
 
 ```sh
 # this server against the bare model in the same vLLM, clean and with room noise 5 dB under the speech
@@ -417,7 +460,11 @@ Scores:
 Timings are only comparable when nothing else heavy runs at the same time. On a CPU, two runs side by
 side also share memory bandwidth, so run them one after another, as the scripts do.
 
+</details>
+
 ## How it works
+
+<details><summary>Show</summary>
 
 ```
 Home Assistant ──Wyoming──▶ wyoming/server.py ──HTTP──▶ vLLM: Qwen3-ASR + plugin/asr_bias.py
@@ -447,7 +494,11 @@ Home Assistant ──Wyoming──▶ wyoming/server.py ──HTTP──▶ vLLM
 - When a request doesn't ask for it, the plugin leaves it alone. That's why `vllm://` in the benchmark
   is the bare model.
 
+</details>
+
 ## Files
+
+<details><summary>Show</summary>
 
 ```
 docker-compose.yml   the full version: vLLM (built from vllm-slim/) + the Wyoming server
@@ -467,3 +518,5 @@ data/                bias.json, rec/ (recordings), sets/ (datasets); not in git
 ```
 
 MIT (LICENSE) for this project's own code. The models (Qwen3-ASR, OmniVoice), vLLM and llama.cpp have their own licences.
+
+</details>
