@@ -7,17 +7,19 @@
 #
 # Whether a setting breaks can change from one start of llama.cpp to the next; "soak" after the id starts the
 # candidates many times each and counts:  ... -- 113 soak
-# "builds" does that for older llama.cpp releases (default settings), to see whether a newer one broke it.
+# "builds" does that for older llama.cpp releases (default settings), to see whether a newer one broke it;
+# "mesa" for the Vulkan driver's (RADV's) debug switches, to see what kind of fault it is.
 #
 # The CT needs the GPU (pct set <id> --dev0 /dev/dri/renderD128,gid=993). Its services stop meanwhile
 # (a few minutes) and start again after.
 set -euo pipefail
-ID=${1:?usage: gpu-check.sh <CT id> [soak|builds]}
+ID=${1:?usage: gpu-check.sh <CT id> [soak|builds|mesa]}
 MODE=${2:-}
 command -v pct >/dev/null || { echo "run this on the Proxmox VE host"; exit 1; }
 echo "== host GPU"
 lspci -nn | grep -iE 'vga|display|3d controller' || true
 grep -m1 'model name' /proc/cpuinfo || true
+echo "kernel $(uname -r); $(dpkg -l 'pve-firmware' 2>/dev/null | awk '/^ii/ {print $2, $3}')"
 pct config "$ID" | grep -E '^(dev[0-9]|cores|memory):' || true
 pct exec "$ID" -- test -e /dev/dri/renderD128 || { echo "CT $ID has no GPU: pct set $ID --dev0 /dev/dri/renderD128,gid=993 && pct reboot $ID"; exit 1; }
 
@@ -28,6 +30,7 @@ export HOME=/var/lib/assist-asr LD_LIBRARY_PATH=/app
 systemctl stop assist-asr-wyoming assist-asr-llama
 trap 'kill $pid 2>/dev/null; systemctl start assist-asr-llama assist-asr-wyoming' EXIT
 pid=""
+echo "== the CT's Vulkan driver: $(dpkg -l mesa-vulkan-drivers 2>/dev/null | awk '/^ii/ {print $2, $3}')"
 echo "== llama.cpp's devices"
 /app/llama-server --list-devices 2>&1 | grep -vE '^(warn|load_backend)' | head -5
 echo "== $M, one request per setting"
@@ -87,6 +90,18 @@ try() {  # name, environment, llama-server options; prints OK/BAD with the numbe
   kill $pid 2>/dev/null; wait $pid 2>/dev/null; pid=""
 }
 ALL="GGML_VK_DISABLE_COOPMAT=1 GGML_VK_DISABLE_COOPMAT2=1 GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1 GGML_VK_DISABLE_F16=1 GGML_VK_DISABLE_BFLOAT16=1 GGML_VK_DISABLE_MMVQ=1 GGML_VK_DISABLE_DOT2=1 GGML_VK_DISABLE_FUSION=1 GGML_VK_DISABLE_GRAPH_OPTIMIZE=1"
+if [ "$MODE" = mesa ]; then  # RADV's debug switches, 4 starts each, llama.cpp's default settings
+  tally=()
+  for e in "" RADV_DEBUG=zerovram RADV_DEBUG=syncshaders RADV_DEBUG=nocache \
+           "RADV_DEBUG=zerovram,syncshaders" ACO_DEBUG=noopt GGML_VK_DISABLE_ASYNC=1; do
+    name=${e:-"(none)"}; ok=0
+    for i in 1 2 3 4; do try "$name ($i/4)" "$e" "-ngl 99" | tee /tmp/gpu-check.line; grep -q ' OK ' /tmp/gpu-check.line && ok=$((ok + 1)); done
+    tally+=("$(printf '%-36s %d of 4 starts OK' "$name" "$ok")")
+  done
+  echo "== tally"; printf '%s\n' "${tally[@]}"
+  rm -f /tmp/gpu-check.wav /tmp/gpu-check.log /tmp/gpu-check.line
+  exit 0
+fi
 if [ "$MODE" = builds ]; then  # the CT's llama.cpp and older releases, 4 starts each, default settings
   W=/var/tmp/gpu-check-builds; mkdir -p "$W"
   tally=()
