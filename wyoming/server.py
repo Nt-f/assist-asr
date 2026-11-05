@@ -323,10 +323,24 @@ def music_library() -> list:
     return out
 
 
+def _replace(tmp: str, path: str) -> None:
+    """os.replace, which Windows refuses ("[WinError 5] Access is denied") while anything has the file open, an
+    indexer or a virus scanner for a moment: tried again, then the file written in place (issue #1, on Windows)."""
+    for _ in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.1)
+    with open(tmp, "rb") as src, open(path, "wb") as dst:
+        dst.write(src.read())
+    os.remove(tmp)
+
+
 def read_commands():
     cmds, openers = [], {}
     try:
-        with open(COMMANDS_FILE) as f:
+        with open(COMMANDS_FILE, encoding="utf-8") as f:
             for l in f:
                 l = l.split("#")[0].strip()
                 if ">" in l:
@@ -342,7 +356,7 @@ def read_commands():
 def read_list(path: str) -> list:
     """config/music.txt, config/home.txt: names of one's own on top of what HA gives (or without HA)."""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return [l.split("#")[0].strip() for l in f if l.split("#")[0].strip()]
     except OSError:
         return []
@@ -363,14 +377,14 @@ def write_bias(names: list, music: list) -> None:
     _context["lists"] = {k: {asr_bias.norm(n).strip(): n for n in v if asr_bias.norm(n).strip()}
                          for k, v in d["lists"].items()}
     tmp = BIAS_FILE + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f)
-    os.replace(tmp, BIAS_FILE)
+    _replace(tmp, BIAS_FILE)
 
 
 def read_vocab() -> str:
     try:
-        with open(VOCAB_FILE) as f:
+        with open(VOCAB_FILE, encoding="utf-8") as f:
             words = [l.split("#")[0].strip() for l in f]
     except OSError:
         return ""
@@ -404,7 +418,7 @@ async def apply_names(names: list, music: list) -> None:
 
 def load_cache() -> bool:
     try:
-        with open(CACHE_FILE) as f:
+        with open(CACHE_FILE, encoding="utf-8") as f:
             c = json.load(f)
         _context["names"], _context["music"] = c.get("names", []), c.get("music", [])
         return True
@@ -414,9 +428,9 @@ def load_cache() -> bool:
 
 def save_cache() -> None:
     tmp = CACHE_FILE + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"names": _context.get("names", []), "music": _context.get("music", []), "at": time.time()}, f)
-    os.replace(tmp, CACHE_FILE)
+    _replace(tmp, CACHE_FILE)
 
 
 async def refresh() -> bool:
@@ -1229,7 +1243,7 @@ class Handler(AsyncEventHandler):
                 with wave.open(name + ".wav", "wb") as w:
                     w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
                     w.writeframes(pcm)
-                with open(name + ".json", "w") as f:
+                with open(name + ".json", "w", encoding="utf-8") as f:
                     json.dump({"span_ms": [span[0] // 32, span[1] // 32] if span else None,
                                "speech_ms": speech_ms, "raw": raw, "text": text}, f)
             await self.write_event(Transcript(text=text).event())

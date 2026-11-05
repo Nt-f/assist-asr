@@ -128,7 +128,7 @@ def load(path: str):
         if c and c[0] == key:
             return c[1]
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 b = Bias(json.load(f))
         except (OSError, ValueError):
             return c[1] if c else None
